@@ -18,6 +18,7 @@ type AudioRecordSummary = {
   estimatedCostUsd: number;
   createdAt: string;
   updatedAt: string;
+  paragraphText?: string | null;
 };
 
 type SnippetSummary = {
@@ -29,6 +30,7 @@ type SnippetSummary = {
   updatedAt: string;
   versions: number;
   activeAudio?: AudioRecordSummary | null;
+  paragraphAudio: AudioRecordSummary[];
 };
 
 type GenerationEstimate = {
@@ -134,14 +136,15 @@ function App() {
   const [voice, setVoice] = useState("alloy");
   const [model, setModel] = useState("gpt-4o-mini-tts");
   const [readingInstructionsOverride, setReadingInstructionsOverride] = useState("");
-  const [snippetAudioUrl, setSnippetAudioUrl] = useState("");
   const [voiceTestText, setVoiceTestText] = useState("Try a short line before generating the full readback.");
   const [voiceTestAudioUrl, setVoiceTestAudioUrl] = useState("");
   const [voiceTestPlaying, setVoiceTestPlaying] = useState(false);
 
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [playingParagraph, setPlayingParagraph] = useState<number | null>(null);
+  const [generatingParagraph, setGeneratingParagraph] = useState<number | null>(null);
   const [audioProgress, setAudioProgress] = useState({ current: 0, duration: 0 });
+  const [knownDurations, setKnownDurations] = useState<Record<number, number>>({});
 
   const [currentEstimate, setCurrentEstimate] = useState<GenerationEstimate | null>(null);
   const [usageSummary, setUsageSummary] = useState<UsageSummary | null>(null);
@@ -159,16 +162,20 @@ function App() {
   const audioRef = useRef<HTMLAudioElement>(null);
   const voiceTestAudioRef = useRef<HTMLAudioElement>(null);
   const savedFlagTimer = useRef<number | null>(null);
+  const audioUrlCache = useRef(new Map<number, string>());
+  const loadedRecordId = useRef<number | null>(null);
 
   const selectedSnippet = snippets.find((snippet) => snippet.id === selectedSnippetId) ?? null;
   const sessionParagraphs = splitParagraphs(content);
 
-  // A paragraph counts as generated while the saved snippet has completed audio
-  // and still contains that exact paragraph — editing a paragraph makes it stale.
-  const generatedParagraphs =
-    selectedSnippet && selectedSnippet.activeAudio?.status === "generated"
-      ? new Set(splitParagraphs(selectedSnippet.content))
-      : new Set<string>();
+  // Each paragraph maps to its own active audio record, matched by exact text —
+  // editing a paragraph makes it stale until regenerated.
+  const paragraphRecords = new Map<string, AudioRecordSummary>();
+  for (const record of selectedSnippet?.paragraphAudio ?? []) {
+    if (record.status === "generated" && record.paragraphText) {
+      paragraphRecords.set(record.paragraphText, record);
+    }
+  }
 
   const totalParagraphChars = sessionParagraphs.reduce((sum, paragraph) => sum + paragraph.length, 0);
 
@@ -302,7 +309,6 @@ function App() {
     setSelectedSnippetId(null);
     setTitle("");
     setContent("");
-    setSnippetAudioUrl("");
     setOpenMenu(null);
     setStatusMessage("New session draft ready.");
   }
@@ -312,7 +318,6 @@ function App() {
     setSelectedSnippetId(snippet.id);
     setTitle(snippet.title);
     setContent(snippet.content);
-    setSnippetAudioUrl("");
     setOpenMenu(null);
     if (snippet.activeAudio) {
       setVoice(snippet.activeAudio.voice);
@@ -320,67 +325,95 @@ function App() {
     }
   }
 
-  async function handleGenerate(forceRegenerate: boolean) {
-    if (!content.trim()) {
+  function applySnippetSummary(summary: SnippetSummary) {
+    setSelectedSnippetId(summary.id);
+    setTitle(summary.title);
+    setSnippets((current) => {
+      const index = current.findIndex((snippet) => snippet.id === summary.id);
+      if (index === -1) {
+        return [summary, ...current];
+      }
+      const next = [...current];
+      next[index] = summary;
+      return next;
+    });
+  }
+
+  async function requestParagraphAudio(
+    paragraph: string,
+    forceRegenerate: boolean,
+    snippetId: number | null,
+  ) {
+    const summary = await invoke<SnippetSummary>("generate_paragraph_audio", {
+      request: {
+        snippetId,
+        title,
+        content,
+        paragraphText: paragraph,
+        voice,
+        model,
+        readingInstructions:
+          readingInstructionsOverride.trim() || usageSettings.defaultReadingInstructions,
+        forceRegenerate,
+      },
+    });
+    applySnippetSummary(summary);
+    return summary;
+  }
+
+  async function handleGenerateParagraph(index: number, forceRegenerate: boolean) {
+    const paragraph = sessionParagraphs[index];
+    if (!paragraph) {
+      return;
+    }
+
+    setBusy(true);
+    setGeneratingParagraph(index);
+    setErrorMessage("");
+    setStatusMessage(forceRegenerate ? "Regenerating paragraph..." : "Generating paragraph...");
+    try {
+      await requestParagraphAudio(paragraph, forceRegenerate, selectedSnippetId);
+      await refreshUsageData();
+      setStatusMessage(forceRegenerate ? "Paragraph regenerated." : "Paragraph readback ready.");
+    } catch (error) {
+      setErrorMessage(String(error));
+    } finally {
+      setBusy(false);
+      setGeneratingParagraph(null);
+    }
+  }
+
+  async function handleGenerateAll() {
+    if (sessionParagraphs.length === 0) {
       setErrorMessage("Add text content before generating audio.");
       return;
     }
 
     setBusy(true);
     setErrorMessage("");
-    setStatusMessage(forceRegenerate ? "Regenerating audio..." : "Generating audio...");
-    stopPlayback();
+    setStatusMessage("Generating readbacks...");
+    let snippetId = selectedSnippetId;
     try {
-      const generated = await invoke<SnippetSummary>("generate_audio", {
-        request: {
-          snippetId: selectedSnippetId,
-          title,
-          content,
-          voice,
-          model,
-          readingInstructions:
-            readingInstructionsOverride.trim() || usageSettings.defaultReadingInstructions,
-          forceRegenerate,
-        },
-      });
-
-      setSelectedSnippetId(generated.id);
-      setTitle(generated.title);
-      setContent(generated.content);
-      setStatusMessage(forceRegenerate ? "Audio regenerated." : "Audio generated.");
-
-      await refreshSnippets();
+      for (let index = 0; index < sessionParagraphs.length; index += 1) {
+        const paragraph = sessionParagraphs[index];
+        if (paragraphRecords.has(paragraph)) {
+          continue;
+        }
+        setGeneratingParagraph(index);
+        const summary = await requestParagraphAudio(paragraph, false, snippetId);
+        snippetId = summary.id;
+      }
       await refreshUsageData();
-
-      if (generated.activeAudio) {
-        await playAudioRecord(generated.activeAudio.id, false);
-      }
+      setStatusMessage("Readbacks generated.");
     } catch (error) {
       setErrorMessage(String(error));
     } finally {
       setBusy(false);
+      setGeneratingParagraph(null);
     }
   }
 
-  async function playAudioRecord(audioRecordId: number, updateStatus = true) {
-    setBusy(true);
-    setErrorMessage("");
-    try {
-      const dataUrl = await invoke<string>("get_audio_data_url", { audioRecordId });
-      setSnippetAudioUrl(dataUrl);
-      if (updateStatus) {
-        setStatusMessage("Loaded audio for playback.");
-      }
-      return dataUrl;
-    } catch (error) {
-      setErrorMessage(String(error));
-      return "";
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function toggleParagraphPlayback(index: number) {
+  async function toggleParagraphPlayback(index: number, record: AudioRecordSummary) {
     const audioElement = audioRef.current;
     if (!audioElement) {
       return;
@@ -391,20 +424,19 @@ function App() {
       return;
     }
 
-    let url = snippetAudioUrl;
-    if (!url && selectedSnippet?.activeAudio) {
-      url = await playAudioRecord(selectedSnippet.activeAudio.id, false);
-    }
-    if (!url) {
-      return;
-    }
-
     try {
-      if (audioElement.getAttribute("src") !== url) {
+      let url = audioUrlCache.current.get(record.id);
+      if (!url) {
+        url = await invoke<string>("get_audio_data_url", { audioRecordId: record.id });
+        audioUrlCache.current.set(record.id, url);
+      }
+      if (loadedRecordId.current !== record.id) {
         audioElement.src = url;
+        loadedRecordId.current = record.id;
       }
       audioElement.currentTime = 0;
       await audioElement.play();
+      setAudioProgress({ current: 0, duration: knownDurations[record.id] ?? 0 });
       setPlayingParagraph(index);
     } catch (error) {
       setErrorMessage(String(error));
@@ -637,7 +669,7 @@ function App() {
 
               <button
                 className="accent-button generate-button"
-                onClick={() => void handleGenerate(false)}
+                onClick={() => void handleGenerateAll()}
                 disabled={busy}
                 type="button"
               >
@@ -680,7 +712,8 @@ function App() {
                           >
                             <span className="session-item-title">{snippet.title || "Untitled session"}</span>
                             <span className="session-item-meta">
-                              {snippet.versions} {snippet.versions === 1 ? "readback" : "readbacks"}
+                              {snippet.paragraphAudio.length}{" "}
+                              {snippet.paragraphAudio.length === 1 ? "readback" : "readbacks"}
                             </span>
                           </button>
                         ))
@@ -746,9 +779,11 @@ function App() {
                 ) : (
                   <div className="paragraph-list">
                     {sessionParagraphs.map((paragraph, index) => {
-                      const isGenerated = generatedParagraphs.has(paragraph);
+                      const record = paragraphRecords.get(paragraph) ?? null;
                       const isPlaying = playingParagraph === index;
-                      const estimatedSeconds = paragraphDuration(paragraph);
+                      const isGenerating = generatingParagraph === index;
+                      const displaySeconds =
+                        (record ? knownDurations[record.id] : undefined) ?? paragraphDuration(paragraph);
                       const progressPct =
                         isPlaying && audioProgress.duration > 0
                           ? Math.min(100, (audioProgress.current / audioProgress.duration) * 100)
@@ -758,15 +793,15 @@ function App() {
                           <div className="paragraph-card-header">
                             <span className="micro-label">Paragraph {index + 1}</span>
                             <span className="paragraph-card-meta">
-                              {isGenerated ? formatTime(estimatedSeconds) : "not generated"}
+                              {record ? formatTime(displaySeconds) : "not generated"}
                             </span>
                           </div>
                           <p className="paragraph-text">{paragraph}</p>
-                          {isGenerated ? (
+                          {record ? (
                             <div className="playback-row">
                               <button
                                 className="play-button"
-                                onClick={() => void toggleParagraphPlayback(index)}
+                                onClick={() => void toggleParagraphPlayback(index, record)}
                                 disabled={busy && !isPlaying}
                                 title={isPlaying ? "Pause" : "Play"}
                                 type="button"
@@ -779,26 +814,26 @@ function App() {
                               <span className="time-label">
                                 {isPlaying
                                   ? `${formatTime(audioProgress.current)} / ${formatTime(audioProgress.duration)}`
-                                  : `0:00 / ${formatTime(estimatedSeconds)}`}
+                                  : `0:00 / ${formatTime(displaySeconds)}`}
                               </span>
                               <button
                                 className="regen-button"
-                                onClick={() => void handleGenerate(true)}
+                                onClick={() => void handleGenerateParagraph(index, true)}
                                 disabled={busy}
                                 title="Regenerate"
                                 type="button"
                               >
-                                ↻
+                                {isGenerating ? "…" : "↻"}
                               </button>
                             </div>
                           ) : (
                             <button
                               className="generate-readback-button"
-                              onClick={() => void handleGenerate(selectedSnippet?.activeAudio ? true : false)}
+                              onClick={() => void handleGenerateParagraph(index, false)}
                               disabled={busy}
                               type="button"
                             >
-                              {busy ? "Generating…" : "Generate readback"}
+                              {isGenerating ? "Generating…" : "Generate readback"}
                             </button>
                           )}
                         </article>
@@ -1003,7 +1038,13 @@ function App() {
 
       <audio
         ref={audioRef}
-        src={snippetAudioUrl || undefined}
+        onLoadedMetadata={(event) => {
+          const duration = event.currentTarget.duration;
+          const recordId = loadedRecordId.current;
+          if (recordId !== null && Number.isFinite(duration)) {
+            setKnownDurations((current) => ({ ...current, [recordId]: duration }));
+          }
+        }}
         onTimeUpdate={(event) =>
           setAudioProgress({
             current: event.currentTarget.currentTime,
