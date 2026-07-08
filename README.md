@@ -25,8 +25,9 @@ The start script will:
 - Install npm dependencies.
 - Start the app with `npm run tauri dev`.
 
-If Linux system GUI dependencies are missing, the script stops and prints the
-exact install command before any long build starts.
+If Linux system GUI dependencies are missing, the script offers to install
+them for you (via `sudo apt-get` on Debian/Ubuntu/Mint) before any long build
+starts; on other distros it prints the package list and stops.
 
 ## Linux system packages
 

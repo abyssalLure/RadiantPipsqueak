@@ -93,42 +93,72 @@ MSG
   exit 1
 }
 
-ensure_tauri_linux_deps() {
-  if [[ "${SKIP_DEP_CHECK:-0}" == "1" ]]; then
-    return
-  fi
+TAURI_APT_PACKAGES=(
+  build-essential pkg-config libssl-dev libglib2.0-dev libgtk-3-dev
+  libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev librsvg2-dev
+)
 
-  local missing=()
-
+missing_tauri_deps() {
   if ! command -v pkg-config >/dev/null 2>&1; then
-    missing+=("pkg-config")
-  else
-    local probes=(glib-2.0 gobject-2.0 gtk+-3.0 gdk-3.0 webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 librsvg-2.0)
-    for probe in "${probes[@]}"; do
-      if ! pkg-config --exists "$probe" 2>/dev/null; then
-        missing+=("$probe")
-      fi
-    done
-  fi
-
-  if [[ "${#missing[@]}" -eq 0 ]]; then
+    echo "pkg-config"
     return
   fi
+  local probes=(glib-2.0 gobject-2.0 gtk+-3.0 gdk-3.0 webkit2gtk-4.1 javascriptcoregtk-4.1 libsoup-3.0 librsvg-2.0)
+  local probe
+  for probe in "${probes[@]}"; do
+    if ! pkg-config --exists "$probe" 2>/dev/null; then
+      echo "$probe"
+    fi
+  done
+}
 
+print_tauri_deps_help() {
   cat <<MSG
-Missing Linux GUI build dependencies for Tauri: ${missing[*]}
+On Debian, Ubuntu, or Linux Mint, install them with:
 
-The Rust build would fail part-way through without them. On Debian, Ubuntu,
-or Linux Mint, install them with:
-
-  sudo apt update
-  sudo apt install -y build-essential pkg-config libssl-dev libglib2.0-dev libgtk-3-dev \\
-    libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev librsvg2-dev
+  sudo apt-get update
+  sudo apt-get install -y ${TAURI_APT_PACKAGES[*]}
 
 For other distros, see https://tauri.app/start/prerequisites/ for the
 equivalent package list, then run ./start.sh again.
 (Set SKIP_DEP_CHECK=1 to bypass this check.)
 MSG
+}
+
+ensure_tauri_linux_deps() {
+  if [[ "${SKIP_DEP_CHECK:-0}" == "1" ]]; then
+    return
+  fi
+
+  local missing
+  missing="$(missing_tauri_deps)"
+  if [[ -z "$missing" ]]; then
+    return
+  fi
+
+  echo "Missing Linux GUI build dependencies for Tauri:" $missing
+  echo "The Rust build would fail part-way through without them."
+
+  # Offer to install automatically where we know the package manager and can
+  # prompt for sudo interactively.
+  if command -v apt-get >/dev/null 2>&1 && [[ -t 0 ]]; then
+    local reply=""
+    read -r -p "Install them now with 'sudo apt-get install'? [Y/n] " reply || reply="n"
+    if [[ ! "$reply" =~ ^[Nn] ]]; then
+      if sudo apt-get update && sudo apt-get install -y "${TAURI_APT_PACKAGES[@]}"; then
+        missing="$(missing_tauri_deps)"
+        if [[ -z "$missing" ]]; then
+          echo "All Tauri build dependencies are installed."
+          return
+        fi
+        echo "Still missing after install:" $missing
+      else
+        echo "Automatic install failed."
+      fi
+    fi
+  fi
+
+  print_tauri_deps_help
   exit 1
 }
 
