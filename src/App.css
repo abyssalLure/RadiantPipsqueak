@@ -415,6 +415,16 @@ button:disabled {
   font-size: 13.5px;
   background: transparent;
   color: var(--ink);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.menu-item-note {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--ink-label);
 }
 
 .menu-item:hover {
@@ -440,6 +450,8 @@ button:disabled {
   border-radius: 9px;
   display: flex;
   flex-direction: column;
+  align-items: flex-start;
+  justify-content: flex-start;
   gap: 3px;
 }
 
@@ -484,6 +496,8 @@ button:disabled {
 }
 
 .editor-pane {
+  display: flex;
+  flex-direction: column;
   overflow: auto;
   padding: 30px 36px;
   border-right: 1px solid var(--line);
@@ -495,6 +509,7 @@ button:disabled {
   align-items: center;
   justify-content: space-between;
   margin-bottom: 22px;
+  flex-shrink: 0;
 }
 
 .session-switcher {
@@ -535,6 +550,7 @@ button:disabled {
 
 .manuscript-input {
   width: 100%;
+  flex: 1;
   min-height: 280px;
   border: none;
   background: transparent;
@@ -552,6 +568,7 @@ button:disabled {
   border: 1px dashed var(--line-input);
   border-radius: 12px;
   background: #f7f3ec;
+  flex-shrink: 0;
 }
 
 .direction-box .micro-label {
@@ -748,50 +765,6 @@ button:disabled {
   font-weight: 600;
   padding: 9px;
   border-radius: 9px;
-}
-
-/* ===================== voice test footer ===================== */
-
-.voice-test-footer {
-  border-top: 1px solid var(--line);
-  padding: 14px 34px;
-  background: var(--panel-alt);
-  flex-shrink: 0;
-}
-
-.voice-test-pill {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  padding: 9px 10px 9px 16px;
-  border: 1px solid #e6e0d3;
-  border-radius: 999px;
-  background: #fff;
-}
-
-.voice-test-pill .micro-label {
-  font-weight: 400;
-  white-space: nowrap;
-}
-
-.voice-test-input {
-  flex: 1;
-  border: none;
-  background: transparent;
-  font-size: 13.5px;
-  color: var(--ink-body);
-  min-width: 0;
-}
-
-.preview-button {
-  border: none;
-  background: var(--accent-chip);
-  color: var(--accent-dark);
-  font-size: 13px;
-  font-weight: 600;
-  padding: 8px 17px;
-  border-radius: 999px;
-  white-space: nowrap;
 }
 
 /* ===================== usage tab ===================== */
