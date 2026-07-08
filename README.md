@@ -25,7 +25,22 @@ The start script will:
 - Install npm dependencies.
 - Start the app with `npm run tauri dev`.
 
-If Linux system GUI dependencies are missing, the script prints package hints.
+If Linux system GUI dependencies are missing, the script offers to install
+them for you (via `sudo apt-get` on Debian/Ubuntu/Mint) before any long build
+starts; on other distros it prints the package list and stops.
+
+## Linux system packages
+
+Tauri needs the GTK/WebKit development libraries. On Debian, Ubuntu, or
+Linux Mint:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libssl-dev libglib2.0-dev libgtk-3-dev \
+  libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev librsvg2-dev
+```
+
+For other distros, see the [Tauri prerequisites](https://tauri.app/start/prerequisites/).
 
 ## Manual commands
 
