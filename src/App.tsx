@@ -136,8 +136,7 @@ function App() {
   const [voice, setVoice] = useState("alloy");
   const [model, setModel] = useState("gpt-4o-mini-tts");
   const [readingInstructionsOverride, setReadingInstructionsOverride] = useState("");
-  const [voiceTestText, setVoiceTestText] = useState("Try a short line before generating the full readback.");
-  const [voiceTestPlaying, setVoiceTestPlaying] = useState(false);
+  const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
 
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
   const [playingParagraph, setPlayingParagraph] = useState<number | null>(null);
@@ -159,9 +158,10 @@ function App() {
   const [settingsSaved, setSettingsSaved] = useState(false);
 
   const audioRef = useRef<HTMLAudioElement>(null);
-  const voiceTestAudioRef = useRef<HTMLAudioElement>(null);
+  const previewAudioRef = useRef<HTMLAudioElement>(null);
   const savedFlagTimer = useRef<number | null>(null);
   const audioUrlCache = useRef(new Map<number, string>());
+  const voicePreviewCache = useRef(new Map<string, string>());
   const loadedRecordId = useRef<number | null>(null);
   // While generating, playback that catches up to a not-yet-voiced paragraph
   // parks its index here; the generation loop resumes it when the audio lands.
@@ -170,11 +170,18 @@ function App() {
   const selectedSnippet = snippets.find((snippet) => snippet.id === selectedSnippetId) ?? null;
   const sessionParagraphs = splitParagraphs(content);
 
-  // Each paragraph maps to its own active audio record, matched by exact text —
-  // editing a paragraph makes it stale until regenerated.
+  // Each paragraph maps to its audio record for the current voice and model,
+  // matched by exact text — editing a paragraph or switching voice makes it
+  // "not generated" until that variant exists. Other voices' audio is kept, so
+  // switching back is instant and free.
   const paragraphRecords = new Map<string, AudioRecordSummary>();
   for (const record of selectedSnippet?.paragraphAudio ?? []) {
-    if (record.status === "generated" && record.paragraphText) {
+    if (
+      record.status === "generated" &&
+      record.paragraphText &&
+      record.voice === voice &&
+      record.model === model
+    ) {
       paragraphRecords.set(record.paragraphText, record);
     }
   }
@@ -419,7 +426,10 @@ function App() {
         snippetId = summary.id;
 
         const record = summary.paragraphAudio.find(
-          (candidate) => candidate.paragraphText === paragraph,
+          (candidate) =>
+            candidate.paragraphText === paragraph &&
+            candidate.voice === voice &&
+            candidate.model === model,
         );
         if (record && autoplayArmed) {
           autoplayArmed = false;
@@ -474,33 +484,34 @@ function App() {
     await playParagraph(index, record);
   }
 
-  async function runVoiceTest() {
-    if (!voiceTestText.trim()) {
-      setErrorMessage("Add preview text before running a voice test.");
+  async function previewVoice(voiceName: string) {
+    const previewElement = previewAudioRef.current;
+    if (!previewElement) {
       return;
     }
 
-    setBusy(true);
     setErrorMessage("");
-    setStatusMessage("Generating voice test...");
-    setVoiceTestPlaying(true);
+    setPreviewingVoice(voiceName);
     try {
-      const dataUrl = await invoke<string>("generate_voice_preview", {
-        text: voiceTestText,
-        voice,
-        model,
-      });
-      setStatusMessage("Voice test ready.");
-      const previewElement = voiceTestAudioRef.current;
-      if (previewElement) {
-        previewElement.src = dataUrl;
-        await previewElement.play();
+      const cacheKey = `${voiceName}|${model}`;
+      let url = voicePreviewCache.current.get(cacheKey);
+      if (!url) {
+        url = await invoke<string>("generate_voice_preview", {
+          text: `Hello, this is what ${voiceName} sounds like.`,
+          voice: voiceName,
+          model,
+        });
+        voicePreviewCache.current.set(cacheKey, url);
       }
+      previewElement.src = url;
+      await previewElement.play();
+      // Re-assert: swapping src while a previous preview played fires 'pause',
+      // which clears the indicator.
+      setPreviewingVoice(voiceName);
+      setStatusMessage(`Previewing the ${voiceName} voice.`);
     } catch (error) {
       setErrorMessage(String(error));
-      setVoiceTestPlaying(false);
-    } finally {
-      setBusy(false);
+      setPreviewingVoice(null);
     }
   }
 
@@ -662,11 +673,14 @@ function App() {
                         className={voiceName === voice ? "menu-item selected" : "menu-item"}
                         onClick={() => {
                           setVoice(voiceName);
-                          setOpenMenu(null);
+                          void previewVoice(voiceName);
                         }}
                         type="button"
                       >
                         {voiceName}
+                        {previewingVoice === voiceName ? (
+                          <span className="menu-item-note">playing</span>
+                        ) : null}
                       </button>
                     ))}
                   </div>
@@ -896,26 +910,6 @@ function App() {
                 )}
               </div>
 
-              <div className="voice-test-footer">
-                <div className="voice-test-pill">
-                  <span className="micro-label">Voice test</span>
-                  <input
-                    className="voice-test-input"
-                    value={voiceTestText}
-                    onChange={(event) => setVoiceTestText(event.currentTarget.value)}
-                    placeholder="Try a short line first."
-                    aria-label="Voice test text"
-                  />
-                  <button
-                    className="preview-button"
-                    onClick={() => void runVoiceTest()}
-                    disabled={busy}
-                    type="button"
-                  >
-                    {voiceTestPlaying ? "Playing…" : "Preview"}
-                  </button>
-                </div>
-              </div>
             </section>
           </div>
         ) : (
@@ -1122,9 +1116,9 @@ function App() {
         }}
       />
       <audio
-        ref={voiceTestAudioRef}
-        onEnded={() => setVoiceTestPlaying(false)}
-        onPause={() => setVoiceTestPlaying(false)}
+        ref={previewAudioRef}
+        onEnded={() => setPreviewingVoice(null)}
+        onPause={() => setPreviewingVoice(null)}
       />
 
       <div className="visually-hidden" role="status" aria-live="polite">

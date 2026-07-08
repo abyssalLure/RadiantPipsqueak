@@ -390,10 +390,15 @@ async fn generate_paragraph_audio(
         &now,
     )?;
 
-    if !force_regenerate
-        && find_paragraph_audio(&conn, snippet_id, &paragraph_hash, &voice, &model)?.is_some()
-    {
-        return get_snippet_summary(&conn, snippet_id);
+    if !force_regenerate {
+        if let Some((record_id, is_active)) =
+            find_paragraph_audio(&conn, snippet_id, &paragraph_hash, &voice, &model)?
+        {
+            if !is_active {
+                reactivate_paragraph_audio(&mut conn, snippet_id, &paragraph_hash, &voice, &model, record_id)?;
+            }
+            return get_snippet_summary(&conn, snippet_id);
+        }
     }
 
     let projected = compute_limit_status(&conn, &settings, estimate.estimated_cost_usd, estimate.char_count)?;
@@ -421,8 +426,9 @@ async fn generate_paragraph_audio(
         .transaction()
         .map_err(|e| format!("Failed to open database transaction: {e}"))?;
     tx.execute(
-        "UPDATE audio_records SET is_active = 0 WHERE snippet_id = ?1 AND paragraph_hash = ?2",
-        params![snippet_id, paragraph_hash],
+        "UPDATE audio_records SET is_active = 0
+         WHERE snippet_id = ?1 AND paragraph_hash = ?2 AND voice = ?3 AND model = ?4",
+        params![snippet_id, paragraph_hash, voice, model],
     )
     .map_err(|e| format!("Failed to deactivate old paragraph audio: {e}"))?;
 
@@ -850,28 +856,58 @@ fn upsert_snippet(
     Ok(conn.last_insert_rowid())
 }
 
+// Finds existing audio for this exact paragraph/voice/model, active or not, so
+// switching back to a previously used voice reuses its audio instead of paying
+// for another generation.
 fn find_paragraph_audio(
     conn: &Connection,
     snippet_id: i64,
     paragraph_hash: &str,
     voice: &str,
     model: &str,
-) -> Result<Option<i64>, String> {
+) -> Result<Option<(i64, bool)>, String> {
     conn.query_row(
-        "SELECT id FROM audio_records
+        "SELECT id, is_active FROM audio_records
          WHERE snippet_id = ?1
            AND paragraph_hash = ?2
            AND voice = ?3
            AND model = ?4
            AND status = 'generated'
-           AND is_active = 1
-         ORDER BY updated_at DESC
+         ORDER BY is_active DESC, updated_at DESC
          LIMIT 1",
         params![snippet_id, paragraph_hash, voice, model],
-        |row| row.get::<_, i64>(0),
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)? == 1)),
     )
     .optional()
     .map_err(|e| format!("Failed to query existing paragraph audio: {e}"))
+}
+
+fn reactivate_paragraph_audio(
+    conn: &mut Connection,
+    snippet_id: i64,
+    paragraph_hash: &str,
+    voice: &str,
+    model: &str,
+    record_id: i64,
+) -> Result<(), String> {
+    let now = now_iso();
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("Failed to open database transaction: {e}"))?;
+    tx.execute(
+        "UPDATE audio_records SET is_active = 0
+         WHERE snippet_id = ?1 AND paragraph_hash = ?2 AND voice = ?3 AND model = ?4",
+        params![snippet_id, paragraph_hash, voice, model],
+    )
+    .map_err(|e| format!("Failed to deactivate paragraph audio variants: {e}"))?;
+    tx.execute(
+        "UPDATE audio_records SET is_active = 1, updated_at = ?1 WHERE id = ?2",
+        params![now, record_id],
+    )
+    .map_err(|e| format!("Failed to reactivate paragraph audio: {e}"))?;
+    tx.commit()
+        .map_err(|e| format!("Failed to commit paragraph audio reactivation: {e}"))?;
+    Ok(())
 }
 
 // Mirrors the frontend split: paragraphs are separated by blank
