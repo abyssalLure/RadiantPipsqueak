@@ -22,6 +22,7 @@ struct GenerationEstimate {
     estimated_tokens: i64,
     estimated_cost_usd: f64,
     price_per_1m_chars_usd: f64,
+    estimated_duration_seconds: f64,
 }
 
 #[derive(Serialize)]
@@ -1001,12 +1002,15 @@ fn compute_estimate(text: &str, model: &str) -> GenerationEstimate {
     let estimated_tokens = ((char_count as f64) / 4.0).ceil() as i64;
     let price_per_1m_chars_usd = model_price_per_1m_chars(model);
     let estimated_cost_usd = ((char_count as f64) / 1_000_000.0) * price_per_1m_chars_usd;
+    // Rough narration pace: ~14 characters per spoken second.
+    let estimated_duration_seconds = (char_count as f64) / 14.0;
 
     GenerationEstimate {
         char_count,
         estimated_tokens,
         estimated_cost_usd,
         price_per_1m_chars_usd,
+        estimated_duration_seconds,
     }
 }
 

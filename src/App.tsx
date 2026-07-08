@@ -137,7 +137,6 @@ function App() {
   const [model, setModel] = useState("gpt-4o-mini-tts");
   const [readingInstructionsOverride, setReadingInstructionsOverride] = useState("");
   const [voiceTestText, setVoiceTestText] = useState("Try a short line before generating the full readback.");
-  const [voiceTestAudioUrl, setVoiceTestAudioUrl] = useState("");
   const [voiceTestPlaying, setVoiceTestPlaying] = useState(false);
 
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
@@ -164,6 +163,9 @@ function App() {
   const savedFlagTimer = useRef<number | null>(null);
   const audioUrlCache = useRef(new Map<number, string>());
   const loadedRecordId = useRef<number | null>(null);
+  // While generating, playback that catches up to a not-yet-voiced paragraph
+  // parks its index here; the generation loop resumes it when the audio lands.
+  const pendingPlayIndex = useRef<number | null>(null);
 
   const selectedSnippet = snippets.find((snippet) => snippet.id === selectedSnippetId) ?? null;
   const sessionParagraphs = splitParagraphs(content);
@@ -299,6 +301,7 @@ function App() {
   }
 
   function stopPlayback() {
+    pendingPlayIndex.current = null;
     audioRef.current?.pause();
     setPlayingParagraph(null);
     setAudioProgress({ current: 0, duration: 0 });
@@ -393,7 +396,19 @@ function App() {
     setErrorMessage("");
     setStatusMessage("Generating readbacks...");
     let snippetId = selectedSnippetId;
+    // Start reading from the top as soon as audio exists, unless the user is
+    // already listening to something.
+    let autoplayArmed = playingParagraph === null;
+    pendingPlayIndex.current = null;
     try {
+      if (autoplayArmed) {
+        const firstRecord = paragraphRecords.get(sessionParagraphs[0]);
+        if (firstRecord) {
+          autoplayArmed = false;
+          void playParagraph(0, firstRecord);
+        }
+      }
+
       for (let index = 0; index < sessionParagraphs.length; index += 1) {
         const paragraph = sessionParagraphs[index];
         if (paragraphRecords.has(paragraph)) {
@@ -402,6 +417,17 @@ function App() {
         setGeneratingParagraph(index);
         const summary = await requestParagraphAudio(paragraph, false, snippetId);
         snippetId = summary.id;
+
+        const record = summary.paragraphAudio.find(
+          (candidate) => candidate.paragraphText === paragraph,
+        );
+        if (record && autoplayArmed) {
+          autoplayArmed = false;
+          void playParagraph(index, record);
+        } else if (record && pendingPlayIndex.current === index) {
+          pendingPlayIndex.current = null;
+          void playParagraph(index, record);
+        }
       }
       await refreshUsageData();
       setStatusMessage("Readbacks generated.");
@@ -410,17 +436,13 @@ function App() {
     } finally {
       setBusy(false);
       setGeneratingParagraph(null);
+      pendingPlayIndex.current = null;
     }
   }
 
-  async function toggleParagraphPlayback(index: number, record: AudioRecordSummary) {
+  async function playParagraph(index: number, record: AudioRecordSummary) {
     const audioElement = audioRef.current;
     if (!audioElement) {
-      return;
-    }
-
-    if (playingParagraph === index) {
-      stopPlayback();
       return;
     }
 
@@ -440,7 +462,16 @@ function App() {
       setPlayingParagraph(index);
     } catch (error) {
       setErrorMessage(String(error));
+      setPlayingParagraph(null);
     }
+  }
+
+  async function toggleParagraphPlayback(index: number, record: AudioRecordSummary) {
+    if (playingParagraph === index) {
+      stopPlayback();
+      return;
+    }
+    await playParagraph(index, record);
   }
 
   async function runVoiceTest() {
@@ -459,7 +490,6 @@ function App() {
         voice,
         model,
       });
-      setVoiceTestAudioUrl(dataUrl);
       setStatusMessage("Voice test ready.");
       const previewElement = voiceTestAudioRef.current;
       if (previewElement) {
@@ -506,6 +536,13 @@ function App() {
       return 0;
     }
     return currentEstimate.estimatedDurationSeconds * (paragraph.length / totalParagraphChars);
+  }
+
+  function paragraphCost(paragraph: string) {
+    if (!currentEstimate || currentEstimate.charCount === 0) {
+      return null;
+    }
+    return (currentEstimate.estimatedCostUsd / currentEstimate.charCount) * paragraph.length;
   }
 
   if (isLoading) {
@@ -764,8 +801,20 @@ function App() {
               <div className="readback-scroll rp-scroll">
                 <div className="readback-header">
                   <span className="micro-label">Readback</span>
-                  <span className="readback-count">
-                    {sessionParagraphs.length} {sessionParagraphs.length === 1 ? "paragraph" : "paragraphs"}
+                  <span className="readback-header-right">
+                    {sessionParagraphs.some((paragraph) => !paragraphRecords.has(paragraph)) ? (
+                      <button
+                        className="generate-all-link"
+                        onClick={() => void handleGenerateAll()}
+                        disabled={busy}
+                        type="button"
+                      >
+                        Generate all
+                      </button>
+                    ) : null}
+                    <span className="readback-count">
+                      {sessionParagraphs.length} {sessionParagraphs.length === 1 ? "paragraph" : "paragraphs"}
+                    </span>
                   </span>
                 </div>
 
@@ -784,6 +833,7 @@ function App() {
                       const isGenerating = generatingParagraph === index;
                       const displaySeconds =
                         (record ? knownDurations[record.id] : undefined) ?? paragraphDuration(paragraph);
+                      const costEstimate = record ? record.estimatedCostUsd : paragraphCost(paragraph);
                       const progressPct =
                         isPlaying && audioProgress.duration > 0
                           ? Math.min(100, (audioProgress.current / audioProgress.duration) * 100)
@@ -794,6 +844,9 @@ function App() {
                             <span className="micro-label">Paragraph {index + 1}</span>
                             <span className="paragraph-card-meta">
                               {record ? formatTime(displaySeconds) : "not generated"}
+                              {costEstimate !== null
+                                ? ` · ${record ? "" : "~"}${formatCurrency(costEstimate)}`
+                                : ""}
                             </span>
                           </div>
                           <p className="paragraph-text">{paragraph}</p>
@@ -1052,13 +1105,24 @@ function App() {
           })
         }
         onEnded={() => {
-          setPlayingParagraph(null);
           setAudioProgress({ current: 0, duration: 0 });
+          // Continue into the next paragraph when its audio is current; if it's
+          // still being generated, park the index for the loop to resume.
+          const nextIndex = playingParagraph === null ? null : playingParagraph + 1;
+          const nextParagraph = nextIndex === null ? undefined : sessionParagraphs[nextIndex];
+          const nextRecord = nextParagraph ? paragraphRecords.get(nextParagraph) : undefined;
+          if (nextIndex !== null && nextRecord) {
+            void playParagraph(nextIndex, nextRecord);
+            return;
+          }
+          if (nextIndex !== null && nextParagraph && busy) {
+            pendingPlayIndex.current = nextIndex;
+          }
+          setPlayingParagraph(null);
         }}
       />
       <audio
         ref={voiceTestAudioRef}
-        src={voiceTestAudioUrl || undefined}
         onEnded={() => setVoiceTestPlaying(false)}
         onPause={() => setVoiceTestPlaying(false)}
       />

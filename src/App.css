@@ -600,6 +600,25 @@ button:disabled {
   letter-spacing: 0.13em;
 }
 
+.readback-header-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.generate-all-link {
+  border: none;
+  background: transparent;
+  padding: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent-dark);
+}
+
+.generate-all-link:hover:not(:disabled) {
+  opacity: 0.75;
+}
+
 .readback-count {
   font-size: 12px;
   color: var(--ink-label);
