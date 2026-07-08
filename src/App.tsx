@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import "./App.css";
@@ -18,6 +18,7 @@ type AudioRecordSummary = {
   estimatedCostUsd: number;
   createdAt: string;
   updatedAt: string;
+  paragraphText?: string | null;
 };
 
 type SnippetSummary = {
@@ -29,6 +30,7 @@ type SnippetSummary = {
   updatedAt: string;
   versions: number;
   activeAudio?: AudioRecordSummary | null;
+  paragraphAudio: AudioRecordSummary[];
 };
 
 type GenerationEstimate = {
@@ -77,6 +79,8 @@ type UsageLimitStatus = {
   warnings: string[];
 };
 
+type OpenMenu = "voice" | "model" | "session" | null;
+
 const VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
 const MODELS = ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"];
 
@@ -92,6 +96,11 @@ function formatNumber(value: number) {
   return new Intl.NumberFormat("en-US").format(value);
 }
 
+function formatTime(seconds: number) {
+  const total = Math.max(0, Math.round(seconds));
+  return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+}
+
 function splitParagraphs(text: string) {
   return text
     .split(/\n\s*\n+/)
@@ -99,27 +108,14 @@ function splitParagraphs(text: string) {
     .filter(Boolean);
 }
 
-function cycleVoice(currentVoice: string) {
-  const index = VOICES.indexOf(currentVoice);
-  return VOICES[(index + 1) % VOICES.length] ?? VOICES[0];
-}
-
-function MiniActionButton({
-  label,
-  symbol,
-  onClick,
-  disabled,
-}: {
-  label: string;
-  symbol: string;
-  onClick: () => void;
-  disabled?: boolean;
-}) {
+function Wordmark() {
   return (
-    <button className="mini-action-button" type="button" title={label} onClick={onClick} disabled={disabled}>
-      <span aria-hidden="true">{symbol}</span>
-      <small>{label}</small>
-    </button>
+    <div className="wordmark">
+      <span className="wordmark-ring" aria-hidden="true">
+        <span className="wordmark-dot" />
+      </span>
+      <span className="wordmark-name">Radiant Pipsqueak</span>
+    </div>
   );
 }
 
@@ -140,9 +136,15 @@ function App() {
   const [voice, setVoice] = useState("alloy");
   const [model, setModel] = useState("gpt-4o-mini-tts");
   const [readingInstructionsOverride, setReadingInstructionsOverride] = useState("");
-  const [snippetAudioUrl, setSnippetAudioUrl] = useState("");
   const [voiceTestText, setVoiceTestText] = useState("Try a short line before generating the full readback.");
   const [voiceTestAudioUrl, setVoiceTestAudioUrl] = useState("");
+  const [voiceTestPlaying, setVoiceTestPlaying] = useState(false);
+
+  const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
+  const [playingParagraph, setPlayingParagraph] = useState<number | null>(null);
+  const [generatingParagraph, setGeneratingParagraph] = useState<number | null>(null);
+  const [audioProgress, setAudioProgress] = useState({ current: 0, duration: 0 });
+  const [knownDurations, setKnownDurations] = useState<Record<number, number>>({});
 
   const [currentEstimate, setCurrentEstimate] = useState<GenerationEstimate | null>(null);
   const [usageSummary, setUsageSummary] = useState<UsageSummary | null>(null);
@@ -155,12 +157,35 @@ function App() {
   const [usageTimeline, setUsageTimeline] = useState<UsageTimelinePoint[]>([]);
   const [usageLimitStatus, setUsageLimitStatus] = useState<UsageLimitStatus | null>(null);
   const [savingUsageSettings, setSavingUsageSettings] = useState(false);
+  const [settingsSaved, setSettingsSaved] = useState(false);
+
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const voiceTestAudioRef = useRef<HTMLAudioElement>(null);
+  const savedFlagTimer = useRef<number | null>(null);
+  const audioUrlCache = useRef(new Map<number, string>());
+  const loadedRecordId = useRef<number | null>(null);
 
   const selectedSnippet = snippets.find((snippet) => snippet.id === selectedSnippetId) ?? null;
   const sessionParagraphs = splitParagraphs(content);
 
+  // Each paragraph maps to its own active audio record, matched by exact text —
+  // editing a paragraph makes it stale until regenerated.
+  const paragraphRecords = new Map<string, AudioRecordSummary>();
+  for (const record of selectedSnippet?.paragraphAudio ?? []) {
+    if (record.status === "generated" && record.paragraphText) {
+      paragraphRecords.set(record.paragraphText, record);
+    }
+  }
+
+  const totalParagraphChars = sessionParagraphs.reduce((sum, paragraph) => sum + paragraph.length, 0);
+
   useEffect(() => {
     void bootstrap();
+    return () => {
+      if (savedFlagTimer.current !== null) {
+        window.clearTimeout(savedFlagTimer.current);
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -261,79 +286,160 @@ function App() {
     }
   }
 
+  async function handleReplaceKey() {
+    setErrorMessage("");
+    try {
+      await invoke("clear_api_key");
+      setIsConfigured(false);
+      setActiveTab("studio");
+      setStatusMessage("API key removed. Paste a new key to continue.");
+    } catch (error) {
+      setErrorMessage(String(error));
+    }
+  }
+
+  function stopPlayback() {
+    audioRef.current?.pause();
+    setPlayingParagraph(null);
+    setAudioProgress({ current: 0, duration: 0 });
+  }
+
   function handleCreateNew() {
+    stopPlayback();
     setSelectedSnippetId(null);
     setTitle("");
     setContent("");
-    setSnippetAudioUrl("");
-    setStatusMessage("New snippet draft ready.");
+    setOpenMenu(null);
+    setStatusMessage("New session draft ready.");
   }
 
   function selectSnippet(snippet: SnippetSummary) {
+    stopPlayback();
     setSelectedSnippetId(snippet.id);
     setTitle(snippet.title);
     setContent(snippet.content);
-    setSnippetAudioUrl("");
+    setOpenMenu(null);
     if (snippet.activeAudio) {
       setVoice(snippet.activeAudio.voice);
       setModel(snippet.activeAudio.model);
     }
   }
 
-  async function handleGenerate(forceRegenerate: boolean) {
-    if (!content.trim()) {
+  function applySnippetSummary(summary: SnippetSummary) {
+    setSelectedSnippetId(summary.id);
+    setTitle(summary.title);
+    setSnippets((current) => {
+      const index = current.findIndex((snippet) => snippet.id === summary.id);
+      if (index === -1) {
+        return [summary, ...current];
+      }
+      const next = [...current];
+      next[index] = summary;
+      return next;
+    });
+  }
+
+  async function requestParagraphAudio(
+    paragraph: string,
+    forceRegenerate: boolean,
+    snippetId: number | null,
+  ) {
+    const summary = await invoke<SnippetSummary>("generate_paragraph_audio", {
+      request: {
+        snippetId,
+        title,
+        content,
+        paragraphText: paragraph,
+        voice,
+        model,
+        readingInstructions:
+          readingInstructionsOverride.trim() || usageSettings.defaultReadingInstructions,
+        forceRegenerate,
+      },
+    });
+    applySnippetSummary(summary);
+    return summary;
+  }
+
+  async function handleGenerateParagraph(index: number, forceRegenerate: boolean) {
+    const paragraph = sessionParagraphs[index];
+    if (!paragraph) {
+      return;
+    }
+
+    setBusy(true);
+    setGeneratingParagraph(index);
+    setErrorMessage("");
+    setStatusMessage(forceRegenerate ? "Regenerating paragraph..." : "Generating paragraph...");
+    try {
+      await requestParagraphAudio(paragraph, forceRegenerate, selectedSnippetId);
+      await refreshUsageData();
+      setStatusMessage(forceRegenerate ? "Paragraph regenerated." : "Paragraph readback ready.");
+    } catch (error) {
+      setErrorMessage(String(error));
+    } finally {
+      setBusy(false);
+      setGeneratingParagraph(null);
+    }
+  }
+
+  async function handleGenerateAll() {
+    if (sessionParagraphs.length === 0) {
       setErrorMessage("Add text content before generating audio.");
       return;
     }
 
     setBusy(true);
     setErrorMessage("");
-    setStatusMessage(forceRegenerate ? "Regenerating audio..." : "Generating audio...");
+    setStatusMessage("Generating readbacks...");
+    let snippetId = selectedSnippetId;
     try {
-      const generated = await invoke<SnippetSummary>("generate_audio", {
-        request: {
-          snippetId: selectedSnippetId,
-          title,
-          content,
-          voice,
-          model,
-          readingInstructions:
-            readingInstructionsOverride.trim() || usageSettings.defaultReadingInstructions,
-          forceRegenerate,
-        },
-      });
-
-      setSelectedSnippetId(generated.id);
-      setTitle(generated.title);
-      setContent(generated.content);
-      setStatusMessage(forceRegenerate ? "Audio regenerated." : "Audio generated.");
-
-      await refreshSnippets();
-      await refreshUsageData();
-
-      if (generated.activeAudio) {
-        await playAudioRecord(generated.activeAudio.id, false);
+      for (let index = 0; index < sessionParagraphs.length; index += 1) {
+        const paragraph = sessionParagraphs[index];
+        if (paragraphRecords.has(paragraph)) {
+          continue;
+        }
+        setGeneratingParagraph(index);
+        const summary = await requestParagraphAudio(paragraph, false, snippetId);
+        snippetId = summary.id;
       }
+      await refreshUsageData();
+      setStatusMessage("Readbacks generated.");
     } catch (error) {
       setErrorMessage(String(error));
     } finally {
       setBusy(false);
+      setGeneratingParagraph(null);
     }
   }
 
-  async function playAudioRecord(audioRecordId: number, updateStatus = true) {
-    setBusy(true);
-    setErrorMessage("");
+  async function toggleParagraphPlayback(index: number, record: AudioRecordSummary) {
+    const audioElement = audioRef.current;
+    if (!audioElement) {
+      return;
+    }
+
+    if (playingParagraph === index) {
+      stopPlayback();
+      return;
+    }
+
     try {
-      const dataUrl = await invoke<string>("get_audio_data_url", { audioRecordId });
-      setSnippetAudioUrl(dataUrl);
-      if (updateStatus) {
-        setStatusMessage("Loaded audio for playback.");
+      let url = audioUrlCache.current.get(record.id);
+      if (!url) {
+        url = await invoke<string>("get_audio_data_url", { audioRecordId: record.id });
+        audioUrlCache.current.set(record.id, url);
       }
+      if (loadedRecordId.current !== record.id) {
+        audioElement.src = url;
+        loadedRecordId.current = record.id;
+      }
+      audioElement.currentTime = 0;
+      await audioElement.play();
+      setAudioProgress({ current: 0, duration: knownDurations[record.id] ?? 0 });
+      setPlayingParagraph(index);
     } catch (error) {
       setErrorMessage(String(error));
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -346,6 +452,7 @@ function App() {
     setBusy(true);
     setErrorMessage("");
     setStatusMessage("Generating voice test...");
+    setVoiceTestPlaying(true);
     try {
       const dataUrl = await invoke<string>("generate_voice_preview", {
         text: voiceTestText,
@@ -354,8 +461,14 @@ function App() {
       });
       setVoiceTestAudioUrl(dataUrl);
       setStatusMessage("Voice test ready.");
+      const previewElement = voiceTestAudioRef.current;
+      if (previewElement) {
+        previewElement.src = dataUrl;
+        await previewElement.play();
+      }
     } catch (error) {
       setErrorMessage(String(error));
+      setVoiceTestPlaying(false);
     } finally {
       setBusy(false);
     }
@@ -376,6 +489,11 @@ function App() {
       setUsageSettings(saved);
       await refreshUsageData();
       setStatusMessage("Usage settings saved.");
+      setSettingsSaved(true);
+      if (savedFlagTimer.current !== null) {
+        window.clearTimeout(savedFlagTimer.current);
+      }
+      savedFlagTimer.current = window.setTimeout(() => setSettingsSaved(false), 1500);
     } catch (error) {
       setErrorMessage(String(error));
     } finally {
@@ -383,434 +501,581 @@ function App() {
     }
   }
 
+  function paragraphDuration(paragraph: string) {
+    if (!currentEstimate || totalParagraphChars === 0) {
+      return 0;
+    }
+    return currentEstimate.estimatedDurationSeconds * (paragraph.length / totalParagraphChars);
+  }
+
   if (isLoading) {
-    return <main className="app-shell">Loading workspace...</main>;
+    return (
+      <div className="app-viewport">
+        <div className="loading-screen">Loading workspace…</div>
+      </div>
+    );
+  }
+
+  if (!isConfigured) {
+    return (
+      <div className="app-viewport">
+        <div className="onboarding-screen">
+          <div className="onboarding-card">
+            <Wordmark />
+            <h1 className="onboarding-headline">Bring your own voice.</h1>
+            <p className="onboarding-copy">
+              Paste your OpenAI API key once. It's stored locally in encrypted form and used only
+              for text-to-speech generation.
+            </p>
+            <label className="field-label" htmlFor="api-key">
+              OpenAI API key
+            </label>
+            <input
+              id="api-key"
+              className="key-input"
+              type="password"
+              value={apiKey}
+              onChange={(event) => setApiKey(event.currentTarget.value)}
+              placeholder="sk-..."
+            />
+            <p className="key-help">
+              Need a key?{" "}
+              <a
+                href="https://platform.openai.com/api-keys"
+                onClick={(event) => {
+                  event.preventDefault();
+                  void openApiKeyPage();
+                }}
+              >
+                Create one on OpenAI.
+              </a>
+            </p>
+            <button
+              className="accent-button onboarding-save"
+              onClick={() => void handleSaveApiKey()}
+              disabled={savingKey}
+              type="button"
+            >
+              {savingKey ? "Saving…" : "Save and continue"}
+            </button>
+          </div>
+        </div>
+        {errorMessage ? (
+          <div className="error-toast" role="alert">
+            <span>{errorMessage}</span>
+            <button className="error-toast-dismiss" onClick={() => setErrorMessage("")} type="button">
+              Dismiss
+            </button>
+          </div>
+        ) : null}
+      </div>
+    );
   }
 
   return (
-    <main className="app-shell">
-      <div className="star-map" aria-hidden="true" />
+    <div className="app-viewport">
+      <div className="app-shell">
+        <header className="toolbar">
+          <Wordmark />
 
-      {!isConfigured ? (
-        <section className="onboarding-panel">
-          <p>
-            Paste your OpenAI API key once. It is stored locally in encrypted form and used for
-            text-to-voice generation.
-          </p>
-          <label htmlFor="api-key">OpenAI API key</label>
-          <input
-            id="api-key"
-            type="password"
-            value={apiKey}
-            onChange={(event) => setApiKey(event.currentTarget.value)}
-            placeholder="sk-..."
-          />
-          <p className="key-help-row">
-            Need a key?{" "}
-            <a
-              href="https://platform.openai.com/api-keys"
-              className="key-help-link"
-              onClick={(event) => {
-                event.preventDefault();
-                void openApiKeyPage();
-              }}
-            >
-              Create one on OpenAI.
-            </a>
-          </p>
-          <button onClick={handleSaveApiKey} disabled={savingKey}>
-            {savingKey ? "Saving..." : "Save and Continue"}
-          </button>
-          {errorMessage && <p className="error-message">{errorMessage}</p>}
-        </section>
-      ) : (
-        <section className="workspace-grid">
-          <aside className="left-rail">
+          <div className="segmented" role="tablist">
             <button
-              className={activeTab === "studio" ? "rail-button active" : "rail-button"}
-              onClick={() => setActiveTab("studio")}
-              type="button"
-            >
-              <span>Studio</span>
-            </button>
-            <button
-              className={activeTab === "usage" ? "rail-button active" : "rail-button"}
-              onClick={() => setActiveTab("usage")}
-              type="button"
-            >
-              <span>Usage</span>
-            </button>
-            <button className="rail-button" onClick={handleCreateNew} type="button">
-              <span>New</span>
-            </button>
-            <button
-              className="rail-button"
+              className={activeTab === "studio" ? "active" : ""}
               onClick={() => {
-                void refreshSnippets();
-                void refreshUsageData();
+                setActiveTab("studio");
+                setOpenMenu(null);
               }}
               type="button"
             >
-              <span>Sync</span>
+              Studio
             </button>
+            <button
+              className={activeTab === "usage" ? "active" : ""}
+              onClick={() => {
+                setActiveTab("usage");
+                setOpenMenu(null);
+              }}
+              type="button"
+            >
+              Usage
+            </button>
+          </div>
 
-            <div className="rail-divider" />
+          <div className="toolbar-spacer" />
 
-            <div className="rail-list">
-              <small>Sessions</small>
-              {snippets.length === 0 ? (
-                <p className="muted rail-empty">No sessions yet.</p>
-              ) : (
-                snippets.slice(0, 6).map((snippet) => (
+          {activeTab === "studio" ? (
+            <div className="toolbar-controls">
+              <div className="menu-anchor">
+                <button
+                  className="pill-button"
+                  onClick={() => setOpenMenu(openMenu === "voice" ? null : "voice")}
+                  type="button"
+                >
+                  <span className="pill-label">Voice</span>
+                  <span className="pill-value">{voice}</span>
+                  <span className="pill-chevron" aria-hidden="true">
+                    ▾
+                  </span>
+                </button>
+                {openMenu === "voice" ? (
+                  <div className="dropdown-menu">
+                    {VOICES.map((voiceName) => (
+                      <button
+                        key={voiceName}
+                        className={voiceName === voice ? "menu-item selected" : "menu-item"}
+                        onClick={() => {
+                          setVoice(voiceName);
+                          setOpenMenu(null);
+                        }}
+                        type="button"
+                      >
+                        {voiceName}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+
+              <div className="menu-anchor">
+                <button
+                  className="pill-button"
+                  onClick={() => setOpenMenu(openMenu === "model" ? null : "model")}
+                  type="button"
+                >
+                  <span className="pill-label">Model</span>
+                  <span className="pill-value">{model}</span>
+                  <span className="pill-chevron" aria-hidden="true">
+                    ▾
+                  </span>
+                </button>
+                {openMenu === "model" ? (
+                  <div className="dropdown-menu model-menu">
+                    {MODELS.map((modelName) => (
+                      <button
+                        key={modelName}
+                        className={modelName === model ? "menu-item selected" : "menu-item"}
+                        onClick={() => {
+                          setModel(modelName);
+                          setOpenMenu(null);
+                        }}
+                        type="button"
+                      >
+                        {modelName}
+                      </button>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
+
+              <button
+                className="accent-button generate-button"
+                onClick={() => void handleGenerateAll()}
+                disabled={busy}
+                type="button"
+              >
+                {busy ? "Working…" : "Generate"}
+              </button>
+            </div>
+          ) : null}
+        </header>
+
+        {activeTab === "studio" ? (
+          <div className="studio-grid">
+            <section className="editor-pane rp-scroll">
+              <div className="editor-header">
+                <div className="menu-anchor">
                   <button
-                    key={snippet.id}
-                    className={snippet.id === selectedSnippetId ? "rail-session active" : "rail-session"}
-                    onClick={() => selectSnippet(snippet)}
+                    className="session-switcher"
+                    onClick={() => setOpenMenu(openMenu === "session" ? null : "session")}
                     type="button"
                   >
-                    <span>{snippet.title}</span>
-                    <small>{snippet.versions}x</small>
-                  </button>
-                ))
-              )}
-            </div>
-          </aside>
-
-          <section className="main-feed">
-            {activeTab === "studio" ? (
-              <>
-                <header className="feed-header">
-                  <div>
-                    <h1>Session feed</h1>
-                    <p className="muted">Build one paragraph at a time. Each block keeps its own quick actions.</p>
-                  </div>
-                  <div className="feed-status">
-                    <span>{statusMessage}</span>
-                    <span>
-                      {currentEstimate
-                        ? `${formatNumber(currentEstimate.charCount)} chars · ${formatCurrency(currentEstimate.estimatedCostUsd)}`
-                        : "Type to see an estimate."}
+                    <span className="micro-label">Session</span>
+                    <span className="pill-chevron" aria-hidden="true">
+                      ▾
                     </span>
-                  </div>
-                </header>
-
-                <section className="composer-card">
-                  <label htmlFor="title">Session title</label>
-                  <input
-                    id="title"
-                    value={title}
-                    onChange={(event) => setTitle(event.currentTarget.value)}
-                    placeholder="Chapter scene, dialog pass, narration draft..."
-                  />
-
-                  <label htmlFor="content">Submitted paragraph feed</label>
-                  <textarea
-                    id="content"
-                    value={content}
-                    onChange={(event) => setContent(event.currentTarget.value)}
-                    placeholder="Paste one or more paragraphs here..."
-                    rows={8}
-                  />
-
-                  <div className="controls-row compact">
-                    <div>
-                      <label htmlFor="voice">Voice</label>
-                      <select id="voice" value={voice} onChange={(event) => setVoice(event.currentTarget.value)}>
-                        {VOICES.map((voiceName) => (
-                          <option key={voiceName} value={voiceName}>
-                            {voiceName}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                    <div>
-                      <label htmlFor="model">Model</label>
-                      <select id="model" value={model} onChange={(event) => setModel(event.currentTarget.value)}>
-                        {MODELS.map((modelName) => (
-                          <option key={modelName} value={modelName}>
-                            {modelName}
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-
-                  <label htmlFor="reading-instructions">Reading direction</label>
-                  <textarea
-                    id="reading-instructions"
-                    value={readingInstructionsOverride}
-                    onChange={(event) => setReadingInstructionsOverride(event.currentTarget.value)}
-                    placeholder="Example: Read in a warm reflective tone, slightly slower pace, with gentle pauses at commas."
-                    rows={3}
-                  />
-                  <p className="muted">Leave blank to use the default reading direction from Usage and Settings.</p>
-
-                  <div className="action-row compact">
-                    <button onClick={() => void handleGenerate(false)} disabled={busy}>
-                      Submit
-                    </button>
-                    <button onClick={() => void handleGenerate(true)} disabled={busy || selectedSnippet === null}>
-                      Regenerate
-                    </button>
-                    <button
-                      onClick={() =>
-                        selectedSnippet?.activeAudio ? void playAudioRecord(selectedSnippet.activeAudio.id) : undefined
-                      }
-                      disabled={busy || !selectedSnippet?.activeAudio}
-                    >
-                      Playback
-                    </button>
-                  </div>
-
-                  <audio controls src={snippetAudioUrl} className="audio-player" />
-                </section>
-
-                <section className="session-feed">
-                  {sessionParagraphs.length === 0 ? (
-                    <div className="empty-feed">
-                      <h2>No paragraphs yet</h2>
-                      <p className="muted">Paste text above, then submit to see each paragraph appear here.</p>
-                    </div>
-                  ) : (
-                    sessionParagraphs.map((paragraph, index) => (
-                      <article className="paragraph-card" key={`${selectedSnippetId ?? "draft"}-${index}`}>
-                        <div className="paragraph-meta">
-                          <span>Paragraph {index + 1}</span>
-                          <small>{formatNumber(paragraph.length)} chars</small>
-                        </div>
-                        <p>{paragraph}</p>
-                        <div className="paragraph-actions">
-                          <MiniActionButton
-                            label="Play"
-                            symbol="▶"
-                            onClick={() => {
-                              if (selectedSnippet?.activeAudio) {
-                                void playAudioRecord(selectedSnippet.activeAudio.id);
-                              }
-                            }}
-                            disabled={busy || !selectedSnippet?.activeAudio}
-                          />
-                          <MiniActionButton
-                            label="Voice"
-                            symbol="V"
-                            onClick={() => {
-                              setVoice(cycleVoice(voice));
-                              setVoiceTestText(paragraph);
-                            }}
-                          />
-                          <MiniActionButton
-                            label="Test"
-                            symbol="↻"
-                            onClick={() => {
-                              setVoiceTestText(paragraph);
-                              void runVoiceTest();
-                            }}
-                            disabled={busy}
-                          />
-                          <MiniActionButton
-                            label="Use"
-                            symbol="↧"
-                            onClick={() => {
-                              setContent(paragraph);
-                              setStatusMessage("Paragraph copied to the composer.");
-                            }}
-                          />
-                        </div>
-                      </article>
-                    ))
-                  )}
-                </section>
-
-                <section className="inline-utility-panel">
-                  <div className="inline-utility-header">
-                    <h2>Voice test</h2>
-                    <p>Use a short line before generating the full readback.</p>
-                  </div>
-                  <div className="voice-test-row">
-                    <textarea
-                      value={voiceTestText}
-                      onChange={(event) => setVoiceTestText(event.currentTarget.value)}
-                      rows={3}
-                    />
-                    <div className="voice-test-actions">
-                      <button onClick={() => void runVoiceTest()} disabled={busy}>
-                        Run Voice Test
+                  </button>
+                  {openMenu === "session" ? (
+                    <div className="dropdown-menu session-menu">
+                      {snippets.length === 0 ? (
+                        <div className="session-empty">No sessions yet.</div>
+                      ) : (
+                        snippets.map((snippet) => (
+                          <button
+                            key={snippet.id}
+                            className={
+                              snippet.id === selectedSnippetId
+                                ? "menu-item session-item selected"
+                                : "menu-item session-item"
+                            }
+                            onClick={() => selectSnippet(snippet)}
+                            type="button"
+                          >
+                            <span className="session-item-title">{snippet.title || "Untitled session"}</span>
+                            <span className="session-item-meta">
+                              {snippet.paragraphAudio.length}{" "}
+                              {snippet.paragraphAudio.length === 1 ? "readback" : "readbacks"}
+                            </span>
+                          </button>
+                        ))
+                      )}
+                      <div className="menu-divider" />
+                      <button className="menu-item menu-new-session" onClick={handleCreateNew} type="button">
+                        + New session
                       </button>
-                      <audio controls src={voiceTestAudioUrl} className="audio-player" />
+                    </div>
+                  ) : null}
+                </div>
+                <span className="estimate-label">
+                  {currentEstimate
+                    ? `${formatNumber(currentEstimate.charCount)} chars · ~${formatCurrency(currentEstimate.estimatedCostUsd)}`
+                    : "Type to see an estimate."}
+                </span>
+              </div>
+
+              <input
+                className="title-input"
+                value={title}
+                onChange={(event) => setTitle(event.currentTarget.value)}
+                placeholder="Untitled session"
+                aria-label="Session title"
+              />
+
+              <textarea
+                className="manuscript-input rp-scroll"
+                value={content}
+                onChange={(event) => setContent(event.currentTarget.value)}
+                placeholder="Paste one or more paragraphs here. Separate them with a blank line — each becomes its own readback."
+                aria-label="Manuscript"
+              />
+
+              <div className="direction-box">
+                <span className="micro-label">Reading direction</span>
+                <textarea
+                  className="direction-input rp-scroll"
+                  value={readingInstructionsOverride}
+                  onChange={(event) => setReadingInstructionsOverride(event.currentTarget.value)}
+                  placeholder="Leave blank to use the default from Usage & Settings."
+                  aria-label="Reading direction"
+                />
+              </div>
+            </section>
+
+            <section className="readback-pane">
+              <div className="readback-scroll rp-scroll">
+                <div className="readback-header">
+                  <span className="micro-label">Readback</span>
+                  <span className="readback-count">
+                    {sessionParagraphs.length} {sessionParagraphs.length === 1 ? "paragraph" : "paragraphs"}
+                  </span>
+                </div>
+
+                {sessionParagraphs.length === 0 ? (
+                  <div className="readback-empty">
+                    <div className="readback-empty-title">Nothing to read yet</div>
+                    <div className="readback-empty-hint">
+                      Type in the manuscript on the left. Each paragraph appears here, ready to voice.
                     </div>
                   </div>
-                </section>
-              </>
-            ) : (
-              <section className="settings-tab-panel">
-                <div className="usage-panel">
-                  <h2>Usage Snapshot</h2>
-                  <p className="muted">Estimates are approximate and based on character counts.</p>
+                ) : (
+                  <div className="paragraph-list">
+                    {sessionParagraphs.map((paragraph, index) => {
+                      const record = paragraphRecords.get(paragraph) ?? null;
+                      const isPlaying = playingParagraph === index;
+                      const isGenerating = generatingParagraph === index;
+                      const displaySeconds =
+                        (record ? knownDurations[record.id] : undefined) ?? paragraphDuration(paragraph);
+                      const progressPct =
+                        isPlaying && audioProgress.duration > 0
+                          ? Math.min(100, (audioProgress.current / audioProgress.duration) * 100)
+                          : 0;
+                      return (
+                        <article className="paragraph-card" key={`${selectedSnippetId ?? "draft"}-${index}`}>
+                          <div className="paragraph-card-header">
+                            <span className="micro-label">Paragraph {index + 1}</span>
+                            <span className="paragraph-card-meta">
+                              {record ? formatTime(displaySeconds) : "not generated"}
+                            </span>
+                          </div>
+                          <p className="paragraph-text">{paragraph}</p>
+                          {record ? (
+                            <div className="playback-row">
+                              <button
+                                className="play-button"
+                                onClick={() => void toggleParagraphPlayback(index, record)}
+                                disabled={busy && !isPlaying}
+                                title={isPlaying ? "Pause" : "Play"}
+                                type="button"
+                              >
+                                {isPlaying ? "❙❙" : "▶"}
+                              </button>
+                              <div className="progress-track">
+                                <span className="progress-fill" style={{ width: `${progressPct}%` }} />
+                              </div>
+                              <span className="time-label">
+                                {isPlaying
+                                  ? `${formatTime(audioProgress.current)} / ${formatTime(audioProgress.duration)}`
+                                  : `0:00 / ${formatTime(displaySeconds)}`}
+                              </span>
+                              <button
+                                className="regen-button"
+                                onClick={() => void handleGenerateParagraph(index, true)}
+                                disabled={busy}
+                                title="Regenerate"
+                                type="button"
+                              >
+                                {isGenerating ? "…" : "↻"}
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              className="generate-readback-button"
+                              onClick={() => void handleGenerateParagraph(index, false)}
+                              disabled={busy}
+                              type="button"
+                            >
+                              {isGenerating ? "Generating…" : "Generate readback"}
+                            </button>
+                          )}
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
 
-                  <div className="usage-metric-grid">
-                    <div>
-                      <span>Total generations</span>
-                      <strong>{formatNumber(usageSummary?.totalGenerations ?? 0)}</strong>
+              <div className="voice-test-footer">
+                <div className="voice-test-pill">
+                  <span className="micro-label">Voice test</span>
+                  <input
+                    className="voice-test-input"
+                    value={voiceTestText}
+                    onChange={(event) => setVoiceTestText(event.currentTarget.value)}
+                    placeholder="Try a short line first."
+                    aria-label="Voice test text"
+                  />
+                  <button
+                    className="preview-button"
+                    onClick={() => void runVoiceTest()}
+                    disabled={busy}
+                    type="button"
+                  >
+                    {voiceTestPlaying ? "Playing…" : "Preview"}
+                  </button>
+                </div>
+              </div>
+            </section>
+          </div>
+        ) : (
+          <div className="usage-scroll rp-scroll">
+            <div className="usage-grid">
+              <div className="usage-column">
+                <div>
+                  <h2 className="panel-heading">Usage snapshot</h2>
+                  <p className="panel-subline">Estimates are approximate, based on character counts.</p>
+                  <div className="metric-grid">
+                    <div className="metric-card">
+                      <span className="micro-label">Generations</span>
+                      <div className="metric-value">{formatNumber(usageSummary?.totalGenerations ?? 0)}</div>
                     </div>
-                    <div>
-                      <span>Total characters</span>
-                      <strong>{formatNumber(usageSummary?.totalCharacters ?? 0)}</strong>
+                    <div className="metric-card">
+                      <span className="micro-label">Characters</span>
+                      <div className="metric-value">{formatNumber(usageSummary?.totalCharacters ?? 0)}</div>
                     </div>
-                    <div>
-                      <span>Estimated tokens</span>
-                      <strong>{formatNumber(usageSummary?.totalEstimatedTokens ?? 0)}</strong>
+                    <div className="metric-card">
+                      <span className="micro-label">Est. tokens</span>
+                      <div className="metric-value">{formatNumber(usageSummary?.totalEstimatedTokens ?? 0)}</div>
                     </div>
-                    <div>
-                      <span>Estimated spend</span>
-                      <strong>{formatCurrency(usageSummary?.totalEstimatedCostUsd ?? 0)}</strong>
+                    <div className="metric-card">
+                      <span className="micro-label">Est. spend</span>
+                      <div className="metric-value accent">
+                        {formatCurrency(usageSummary?.totalEstimatedCostUsd ?? 0)}
+                      </div>
                     </div>
                   </div>
+                </div>
 
-                  <h2>Model rates</h2>
-                  <div className="rate-list">
+                {usageLimitStatus?.warnings?.length ? (
+                  <div className="warning-card">
+                    {usageLimitStatus.warnings.map((warning) => (
+                      <p key={warning}>{warning}</p>
+                    ))}
+                  </div>
+                ) : null}
+
+                <div>
+                  <span className="micro-label list-label">Model rates</span>
+                  <div className="list-card">
                     {(usageSummary?.modelRates ?? []).map((rate) => (
-                      <div key={rate.model} className="rate-item">
-                        <span>{rate.model}</span>
-                        <strong>{formatCurrency(rate.pricePer1mCharsUsd)} / 1M chars</strong>
+                      <div key={rate.model} className="rate-row">
+                        <span className="rate-row-model">{rate.model}</span>
+                        <span className="rate-row-price">
+                          {formatCurrency(rate.pricePer1mCharsUsd)} / 1M chars
+                        </span>
                       </div>
                     ))}
                   </div>
+                </div>
 
-                  <h2 style={{ marginTop: "1rem" }}>Current month</h2>
-                  <div className="usage-metric-grid">
-                    <div>
-                      <span>Characters</span>
-                      <strong>{formatNumber(usageLimitStatus?.monthCharacters ?? 0)}</strong>
-                    </div>
-                    <div>
-                      <span>Projected characters</span>
-                      <strong>{formatNumber(usageLimitStatus?.projectedMonthCharacters ?? 0)}</strong>
-                    </div>
-                    <div>
-                      <span>Month cost</span>
-                      <strong>{formatCurrency(usageLimitStatus?.monthEstimatedCostUsd ?? 0)}</strong>
-                    </div>
-                    <div>
-                      <span>Projected cost</span>
-                      <strong>{formatCurrency(usageLimitStatus?.projectedMonthEstimatedCostUsd ?? 0)}</strong>
-                    </div>
-                  </div>
-
-                  {usageLimitStatus?.warnings?.length ? (
-                    <div className="limit-warning-box">
-                      {usageLimitStatus.warnings.map((warning) => (
-                        <p key={warning}>{warning}</p>
-                      ))}
-                    </div>
-                  ) : null}
-
-                  <h2 style={{ marginTop: "1rem" }}>Timeline</h2>
-                  <div className="timeline-list">
+                <div>
+                  <span className="micro-label list-label">Last 4 days</span>
+                  <div className="list-card">
                     {usageTimeline.length === 0 ? (
-                      <div className="timeline-row">
-                        <span>No usage history yet.</span>
-                      </div>
+                      <div className="timeline-empty">No usage history yet.</div>
                     ) : (
-                      usageTimeline.map((point) => (
-                        <div key={point.date} className="timeline-row">
-                          <span>{point.date}</span>
-                          <span>{formatNumber(point.generations)} generations</span>
-                          <span>{formatNumber(point.characters)} chars</span>
-                          <span>{formatCurrency(point.estimatedCostUsd)}</span>
-                        </div>
-                      ))
+                      usageTimeline
+                        .slice(-4)
+                        .reverse()
+                        .map((point) => (
+                          <div key={point.date} className="timeline-row">
+                            <span className="timeline-date">{point.date}</span>
+                            <span className="timeline-figure">{formatNumber(point.characters)} chars</span>
+                            <span className="timeline-figure">{formatCurrency(point.estimatedCostUsd)}</span>
+                          </div>
+                        ))
                     )}
                   </div>
                 </div>
+              </div>
 
-                <div className="usage-panel">
-                  <h2>Usage and Settings</h2>
-                  <label htmlFor="monthly-budget">Monthly budget (USD)</label>
+              <div className="settings-card">
+                <h2 className="panel-heading">Usage &amp; settings</h2>
+
+                <label className="field-label" htmlFor="monthly-budget">
+                  Monthly budget (USD)
+                </label>
+                <input
+                  id="monthly-budget"
+                  className="settings-input"
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={usageSettings.monthlyBudgetUsd}
+                  onChange={(event) =>
+                    setUsageSettings((current) => ({
+                      ...current,
+                      monthlyBudgetUsd: Number(event.currentTarget.value),
+                    }))
+                  }
+                />
+
+                <label className="field-label" htmlFor="monthly-chars">
+                  Monthly character limit
+                </label>
+                <input
+                  id="monthly-chars"
+                  className="settings-input"
+                  type="number"
+                  min="0"
+                  step="1"
+                  value={usageSettings.monthlyCharLimit}
+                  onChange={(event) =>
+                    setUsageSettings((current) => ({
+                      ...current,
+                      monthlyCharLimit: Number(event.currentTarget.value),
+                    }))
+                  }
+                />
+
+                <label className="checkbox-row" htmlFor="hard-stop">
                   <input
-                    id="monthly-budget"
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    value={usageSettings.monthlyBudgetUsd}
+                    id="hard-stop"
+                    type="checkbox"
+                    checked={usageSettings.hardStop}
                     onChange={(event) =>
                       setUsageSettings((current) => ({
                         ...current,
-                        monthlyBudgetUsd: Number(event.currentTarget.value),
+                        hardStop: event.currentTarget.checked,
                       }))
                     }
                   />
+                  <span>Hard stop when a limit is reached</span>
+                </label>
 
-                  <label htmlFor="monthly-chars">Monthly character limit</label>
-                  <input
-                    id="monthly-chars"
-                    type="number"
-                    min="0"
-                    step="1"
-                    value={usageSettings.monthlyCharLimit}
-                    onChange={(event) =>
-                      setUsageSettings((current) => ({
-                        ...current,
-                        monthlyCharLimit: Number(event.currentTarget.value),
-                      }))
-                    }
-                  />
+                <label className="field-label" htmlFor="default-reading-instructions">
+                  Default reading direction
+                </label>
+                <textarea
+                  id="default-reading-instructions"
+                  className="settings-textarea rp-scroll"
+                  value={usageSettings.defaultReadingInstructions}
+                  onChange={(event) =>
+                    setUsageSettings((current) => ({
+                      ...current,
+                      defaultReadingInstructions: event.currentTarget.value,
+                    }))
+                  }
+                  placeholder="Example: Read like a calm narrator with warm pacing and gentle pauses."
+                />
 
-                  <label className="inline-toggle" htmlFor="hard-stop">
-                    <input
-                      id="hard-stop"
-                      type="checkbox"
-                      checked={usageSettings.hardStop}
-                      onChange={(event) =>
-                        setUsageSettings((current) => ({
-                          ...current,
-                          hardStop: event.currentTarget.checked,
-                        }))
-                      }
-                    />
-                    Hard stop when a limit is reached
-                  </label>
+                <button
+                  className="accent-button save-settings-button"
+                  onClick={() => void handleSaveUsageSettings()}
+                  disabled={savingUsageSettings}
+                  type="button"
+                >
+                  {savingUsageSettings ? "Saving…" : settingsSaved ? "Saved ✓" : "Save settings"}
+                </button>
 
-                  <label htmlFor="default-reading-instructions">Default reading instructions</label>
-                  <textarea
-                    id="default-reading-instructions"
-                    value={usageSettings.defaultReadingInstructions}
-                    onChange={(event) =>
-                      setUsageSettings((current) => ({
-                        ...current,
-                        defaultReadingInstructions: event.currentTarget.value,
-                      }))
-                    }
-                    rows={6}
-                    placeholder="Example: Read like a calm narrator with warm pacing and gentle pauses."
-                  />
-
-                  <button onClick={() => void handleSaveUsageSettings()} disabled={savingUsageSettings}>
-                    {savingUsageSettings ? "Saving..." : "Save Settings"}
-                  </button>
-
-                  <div className="limit-warning-box" style={{ marginTop: "0.9rem" }}>
-                    <p>
-                      Month key: <strong>{usageLimitStatus?.monthKey ?? "-"}</strong>
-                    </p>
-                    <p>
-                      Budget limit: <strong>{usageLimitStatus?.isBudgetLimitEnabled ? "Enabled" : "Disabled"}</strong>
-                    </p>
-                    <p>
-                      Character limit: <strong>{usageLimitStatus?.isCharLimitEnabled ? "Enabled" : "Disabled"}</strong>
-                    </p>
-                    <p>
-                      Blocked: <strong>{usageLimitStatus?.isBlocked ? "Yes" : "No"}</strong>
-                    </p>
+                <div className="key-footer">
+                  <div>
+                    <div className="key-footer-title">API key</div>
+                    <div className="key-footer-status">
+                      <span className="key-status-dot" aria-hidden="true" />
+                      Connected · stored locally
+                    </div>
                   </div>
+                  <button className="outline-button" onClick={() => void handleReplaceKey()} type="button">
+                    Replace key
+                  </button>
                 </div>
-              </section>
-            )}
-          </section>
-        </section>
-      )}
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
 
-      {errorMessage ? <p className="error-message">{errorMessage}</p> : null}
-    </main>
+      {openMenu ? <div className="menu-backdrop" onClick={() => setOpenMenu(null)} /> : null}
+
+      <audio
+        ref={audioRef}
+        onLoadedMetadata={(event) => {
+          const duration = event.currentTarget.duration;
+          const recordId = loadedRecordId.current;
+          if (recordId !== null && Number.isFinite(duration)) {
+            setKnownDurations((current) => ({ ...current, [recordId]: duration }));
+          }
+        }}
+        onTimeUpdate={(event) =>
+          setAudioProgress({
+            current: event.currentTarget.currentTime,
+            duration: event.currentTarget.duration || 0,
+          })
+        }
+        onEnded={() => {
+          setPlayingParagraph(null);
+          setAudioProgress({ current: 0, duration: 0 });
+        }}
+      />
+      <audio
+        ref={voiceTestAudioRef}
+        src={voiceTestAudioUrl || undefined}
+        onEnded={() => setVoiceTestPlaying(false)}
+        onPause={() => setVoiceTestPlaying(false)}
+      />
+
+      <div className="visually-hidden" role="status" aria-live="polite">
+        {statusMessage}
+      </div>
+
+      {errorMessage ? (
+        <div className="error-toast" role="alert">
+          <span>{errorMessage}</span>
+          <button className="error-toast-dismiss" onClick={() => setErrorMessage("")} type="button">
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

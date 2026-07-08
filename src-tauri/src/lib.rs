@@ -92,6 +92,7 @@ struct AudioRecordSummary {
     estimated_cost_usd: f64,
     created_at: String,
     updated_at: String,
+    paragraph_text: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -105,14 +106,16 @@ struct SnippetSummary {
     updated_at: String,
     versions: i64,
     active_audio: Option<AudioRecordSummary>,
+    paragraph_audio: Vec<AudioRecordSummary>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct GenerateRequest {
+struct GenerateParagraphRequest {
     snippet_id: Option<i64>,
     title: Option<String>,
     content: String,
+    paragraph_text: String,
     voice: Option<String>,
     model: Option<String>,
     reading_instructions: Option<String>,
@@ -335,11 +338,18 @@ fn list_snippets(app: AppHandle) -> Result<Vec<SnippetSummary>, String> {
 }
 
 #[tauri::command]
-async fn generate_audio(app: AppHandle, request: GenerateRequest) -> Result<SnippetSummary, String> {
+async fn generate_paragraph_audio(
+    app: AppHandle,
+    request: GenerateParagraphRequest,
+) -> Result<SnippetSummary, String> {
     ensure_storage(&app)?;
     let content = request.content.trim();
     if content.is_empty() {
         return Err("Text content is required".to_string());
+    }
+    let paragraph = request.paragraph_text.trim();
+    if paragraph.is_empty() {
+        return Err("Paragraph text is required".to_string());
     }
 
     let voice = request
@@ -354,28 +364,20 @@ async fn generate_audio(app: AppHandle, request: GenerateRequest) -> Result<Snip
         .to_string();
     let title = request
         .title
+        .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| derive_title(content))
         .trim()
         .to_string();
     let force_regenerate = request.force_regenerate.unwrap_or(false);
     let content_hash = hash_text(content);
-    let estimate = compute_estimate(content, &model);
+    let paragraph_hash = hash_text(paragraph);
+    let estimate = compute_estimate(paragraph, &model);
 
     let mut conn = db_connection(&app)?;
     let settings = load_usage_settings(&conn)?;
     let reading_instructions = request
         .reading_instructions
         .unwrap_or_else(|| settings.default_reading_instructions.clone());
-
-    let projected = compute_limit_status(&conn, &settings, estimate.estimated_cost_usd, estimate.char_count)?;
-    if projected.is_blocked && settings.hard_stop {
-        let reason = projected
-            .warnings
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "Usage limit reached".to_string());
-        return Err(format!("Generation blocked by usage settings: {reason}"));
-    }
 
     let now = now_iso();
     let snippet_id = upsert_snippet(
@@ -387,73 +389,52 @@ async fn generate_audio(app: AppHandle, request: GenerateRequest) -> Result<Snip
         &now,
     )?;
 
-    if !force_regenerate {
-        if let Some(existing) = find_existing_audio(&conn, &content_hash, &voice, &model)? {
-            set_active_audio(&mut conn, snippet_id, existing.id)?;
-            return get_snippet_summary(&conn, snippet_id);
-        }
+    if !force_regenerate
+        && find_paragraph_audio(&conn, snippet_id, &paragraph_hash, &voice, &model)?.is_some()
+    {
+        return get_snippet_summary(&conn, snippet_id);
+    }
+
+    let projected = compute_limit_status(&conn, &settings, estimate.estimated_cost_usd, estimate.char_count)?;
+    if projected.is_blocked && settings.hard_stop {
+        let reason = projected
+            .warnings
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "Usage limit reached".to_string());
+        return Err(format!("Generation blocked by usage settings: {reason}"));
     }
 
     let api_key = read_api_key(&app)?;
     let bytes = call_openai_tts(
         &api_key,
-        content,
+        paragraph,
         &voice,
         &model,
         Some(reading_instructions.trim()),
     )
     .await?;
-    let audio_path = save_audio_file(&app, snippet_id, &voice, &model, &content_hash, &bytes)?;
+    let audio_path = save_audio_file(&app, snippet_id, &voice, &model, &paragraph_hash, &bytes)?;
 
     let tx = conn
         .transaction()
         .map_err(|e| format!("Failed to open database transaction: {e}"))?;
     tx.execute(
-        "UPDATE audio_records SET is_active = 0 WHERE snippet_id = ?1",
-        params![snippet_id],
+        "UPDATE audio_records SET is_active = 0 WHERE snippet_id = ?1 AND paragraph_hash = ?2",
+        params![snippet_id, paragraph_hash],
     )
-    .map_err(|e| format!("Failed to deactivate old audio: {e}"))?;
+    .map_err(|e| format!("Failed to deactivate old paragraph audio: {e}"))?;
 
     tx.execute(
-        "INSERT INTO audio_records (snippet_id, voice, model, audio_path, status, error, char_count, estimated_tokens, estimated_cost_usd, is_active, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, 'generated', NULL, ?5, ?6, ?7, 1, ?8, ?8)",
-        params![snippet_id, voice, model, audio_path, estimate.char_count, estimate.estimated_tokens, estimate.estimated_cost_usd, now],
+        "INSERT INTO audio_records (snippet_id, voice, model, audio_path, status, error, char_count, estimated_tokens, estimated_cost_usd, is_active, created_at, updated_at, paragraph_hash, paragraph_text)
+         VALUES (?1, ?2, ?3, ?4, 'generated', NULL, ?5, ?6, ?7, 1, ?8, ?8, ?9, ?10)",
+        params![snippet_id, voice, model, audio_path, estimate.char_count, estimate.estimated_tokens, estimate.estimated_cost_usd, now, paragraph_hash, paragraph],
     )
     .map_err(|e| format!("Failed to insert new audio record: {e}"))?;
     tx.commit()
         .map_err(|e| format!("Failed to commit audio generation: {e}"))?;
 
     get_snippet_summary(&conn, snippet_id)
-}
-
-#[tauri::command]
-async fn regenerate_audio(
-    app: AppHandle,
-    snippet_id: i64,
-    voice: Option<String>,
-    model: Option<String>,
-) -> Result<SnippetSummary, String> {
-    let conn = db_connection(&app)?;
-    let (content, title) = conn
-        .query_row(
-            "SELECT content, title FROM snippets WHERE id = ?1",
-            params![snippet_id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .map_err(|e| format!("Snippet not found for regeneration: {e}"))?;
-
-    generate_audio(
-        app,
-        GenerateRequest {
-            snippet_id: Some(snippet_id),
-            title: Some(title),
-            content,
-            voice,
-            model,
-            reading_instructions: None,
-            force_regenerate: Some(true),
-        },
-    )
-    .await
 }
 
 #[tauri::command]
@@ -534,6 +515,8 @@ fn ensure_storage(app: &AppHandle) -> Result<(), String> {
             is_active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
+            paragraph_hash TEXT,
+            paragraph_text TEXT,
             FOREIGN KEY (snippet_id) REFERENCES snippets(id)
         );
 
@@ -685,6 +668,7 @@ fn ensure_audio_records_migrations(conn: &Connection) -> Result<(), String> {
     let mut has_char_count = false;
     let mut has_estimated_tokens = false;
     let mut has_estimated_cost = false;
+    let mut has_paragraph_hash = false;
 
     let mut stmt = conn
         .prepare("PRAGMA table_info(audio_records)")
@@ -703,6 +687,9 @@ fn ensure_audio_records_migrations(conn: &Connection) -> Result<(), String> {
         }
         if column == "estimated_cost_usd" {
             has_estimated_cost = true;
+        }
+        if column == "paragraph_hash" {
+            has_paragraph_hash = true;
         }
     }
 
@@ -726,6 +713,51 @@ fn ensure_audio_records_migrations(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("Failed to migrate audio_records.estimated_cost_usd: {e}"))?;
+    }
+    if !has_paragraph_hash {
+        conn.execute("ALTER TABLE audio_records ADD COLUMN paragraph_hash TEXT", [])
+            .map_err(|e| format!("Failed to migrate audio_records.paragraph_hash: {e}"))?;
+        conn.execute("ALTER TABLE audio_records ADD COLUMN paragraph_text TEXT", [])
+            .map_err(|e| format!("Failed to migrate audio_records.paragraph_text: {e}"))?;
+        backfill_single_paragraph_audio(conn)?;
+    }
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_audio_records_paragraph ON audio_records(snippet_id, paragraph_hash)",
+        [],
+    )
+    .map_err(|e| format!("Failed to create paragraph audio index: {e}"))?;
+
+    Ok(())
+}
+
+// Whole-snippet audio from before per-paragraph generation stays usable when
+// the snippet is a single paragraph; multi-paragraph audio can't be attributed
+// to one paragraph and is left as inactive history.
+fn backfill_single_paragraph_audio(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT id, content FROM snippets")
+        .map_err(|e| format!("Failed to prepare snippet backfill query: {e}"))?;
+    let rows = stmt
+        .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+        .map_err(|e| format!("Failed to query snippets for backfill: {e}"))?;
+
+    let mut single_paragraph_snippets = Vec::new();
+    for row in rows {
+        let (id, content) = row.map_err(|e| format!("Failed to read snippet for backfill: {e}"))?;
+        let paragraphs = split_paragraphs(&content);
+        if paragraphs.len() == 1 {
+            single_paragraph_snippets.push((id, paragraphs.into_iter().next().unwrap()));
+        }
+    }
+
+    for (snippet_id, paragraph) in single_paragraph_snippets {
+        conn.execute(
+            "UPDATE audio_records SET paragraph_hash = ?1, paragraph_text = ?2
+             WHERE snippet_id = ?3 AND is_active = 1 AND paragraph_hash IS NULL AND status = 'generated'",
+            params![hash_text(&paragraph), paragraph, snippet_id],
+        )
+        .map_err(|e| format!("Failed to backfill paragraph audio: {e}"))?;
     }
 
     Ok(())
@@ -817,78 +849,52 @@ fn upsert_snippet(
     Ok(conn.last_insert_rowid())
 }
 
-fn find_existing_audio(
+fn find_paragraph_audio(
     conn: &Connection,
-    content_hash: &str,
+    snippet_id: i64,
+    paragraph_hash: &str,
     voice: &str,
     model: &str,
-) -> Result<Option<AudioRecordSummary>, String> {
+) -> Result<Option<i64>, String> {
     conn.query_row(
-        "
-         SELECT ar.id, ar.voice, ar.model, ar.status, ar.error,
-             COALESCE(ar.char_count, 0), COALESCE(ar.estimated_tokens, 0), COALESCE(ar.estimated_cost_usd, 0.0),
-             ar.created_at, ar.updated_at
-        FROM audio_records ar
-        INNER JOIN snippets s ON s.id = ar.snippet_id
-        WHERE s.content_hash = ?1
-          AND ar.voice = ?2
-          AND ar.model = ?3
-          AND ar.status = 'generated'
-          AND ar.is_active = 1
-        ORDER BY ar.updated_at DESC
-        LIMIT 1
-        ",
-        params![content_hash, voice, model],
-        |row| {
-            Ok(AudioRecordSummary {
-                id: row.get(0)?,
-                voice: row.get(1)?,
-                model: row.get(2)?,
-                status: row.get(3)?,
-                error: row.get(4)?,
-                char_count: row.get(5)?,
-                estimated_tokens: row.get(6)?,
-                estimated_cost_usd: row.get(7)?,
-                created_at: row.get(8)?,
-                updated_at: row.get(9)?,
-            })
-        },
+        "SELECT id FROM audio_records
+         WHERE snippet_id = ?1
+           AND paragraph_hash = ?2
+           AND voice = ?3
+           AND model = ?4
+           AND status = 'generated'
+           AND is_active = 1
+         ORDER BY updated_at DESC
+         LIMIT 1",
+        params![snippet_id, paragraph_hash, voice, model],
+        |row| row.get::<_, i64>(0),
     )
     .optional()
-    .map_err(|e| format!("Failed to query existing audio: {e}"))
+    .map_err(|e| format!("Failed to query existing paragraph audio: {e}"))
 }
 
-fn set_active_audio(conn: &mut Connection, snippet_id: i64, audio_record_id: i64) -> Result<(), String> {
-    let audio_path: String = conn
-        .query_row(
-            "SELECT audio_path FROM audio_records WHERE id = ?1",
-            params![audio_record_id],
-            |row| row.get(0),
-        )
-        .map_err(|e| format!("Unable to locate existing audio record: {e}"))?;
-
-    let now = now_iso();
-    let tx = conn
-        .transaction()
-        .map_err(|e| format!("Failed to open database transaction: {e}"))?;
-    tx.execute(
-        "UPDATE audio_records SET is_active = 0 WHERE snippet_id = ?1",
-        params![snippet_id],
-    )
-    .map_err(|e| format!("Failed to deactivate existing audio: {e}"))?;
-    tx.execute(
-        "INSERT INTO audio_records (snippet_id, voice, model, audio_path, status, error, char_count, estimated_tokens, estimated_cost_usd, is_active, created_at, updated_at)
-         SELECT ?1, voice, model, ?2, 'generated', NULL,
-                COALESCE(char_count, 0), COALESCE(estimated_tokens, 0), COALESCE(estimated_cost_usd, 0.0),
-                1, ?3, ?3
-         FROM audio_records
-         WHERE id = ?4",
-        params![snippet_id, audio_path, now, audio_record_id],
-    )
-    .map_err(|e| format!("Failed to link existing audio: {e}"))?;
-    tx.commit()
-        .map_err(|e| format!("Failed to commit existing audio link: {e}"))?;
-    Ok(())
+// Mirrors the frontend split: paragraphs are separated by blank
+// (whitespace-only) lines, trimmed, with empty entries dropped.
+fn split_paragraphs(text: &str) -> Vec<String> {
+    let mut paragraphs = Vec::new();
+    let mut current = String::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            if !current.trim().is_empty() {
+                paragraphs.push(current.trim().to_string());
+            }
+            current.clear();
+        } else {
+            if !current.is_empty() {
+                current.push('\n');
+            }
+            current.push_str(line);
+        }
+    }
+    if !current.trim().is_empty() {
+        paragraphs.push(current.trim().to_string());
+    }
+    paragraphs
 }
 
 fn get_snippet_summary(conn: &Connection, snippet_id: i64) -> Result<SnippetSummary, String> {
@@ -909,33 +915,56 @@ fn get_snippet_summary(conn: &Connection, snippet_id: i64) -> Result<SnippetSumm
         )
         .map_err(|e| format!("Failed to query snippet summary: {e}"))?;
 
+    let record_from_row = |row: &rusqlite::Row| -> rusqlite::Result<AudioRecordSummary> {
+        Ok(AudioRecordSummary {
+            id: row.get(0)?,
+            voice: row.get(1)?,
+            model: row.get(2)?,
+            status: row.get(3)?,
+            error: row.get(4)?,
+            char_count: row.get(5)?,
+            estimated_tokens: row.get(6)?,
+            estimated_cost_usd: row.get(7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+            paragraph_text: row.get(10)?,
+        })
+    };
+
+    const RECORD_COLUMNS: &str = "id, voice, model, status, error,
+                    COALESCE(char_count, 0), COALESCE(estimated_tokens, 0), COALESCE(estimated_cost_usd, 0.0),
+                    created_at, updated_at, paragraph_text";
+
     let active_audio = conn
         .query_row(
-            "SELECT id, voice, model, status, error,
-                    COALESCE(char_count, 0), COALESCE(estimated_tokens, 0), COALESCE(estimated_cost_usd, 0.0),
-                    created_at, updated_at
-             FROM audio_records
-             WHERE snippet_id = ?1 AND is_active = 1
-             ORDER BY updated_at DESC
-             LIMIT 1",
+            &format!(
+                "SELECT {RECORD_COLUMNS}
+                 FROM audio_records
+                 WHERE snippet_id = ?1 AND is_active = 1
+                 ORDER BY updated_at DESC
+                 LIMIT 1"
+            ),
             params![snippet_id],
-            |row| {
-                Ok(AudioRecordSummary {
-                    id: row.get(0)?,
-                    voice: row.get(1)?,
-                    model: row.get(2)?,
-                    status: row.get(3)?,
-                    error: row.get(4)?,
-                    char_count: row.get(5)?,
-                    estimated_tokens: row.get(6)?,
-                    estimated_cost_usd: row.get(7)?,
-                    created_at: row.get(8)?,
-                    updated_at: row.get(9)?,
-                })
-            },
+            record_from_row,
         )
         .optional()
         .map_err(|e| format!("Failed to query active audio: {e}"))?;
+
+    let mut paragraph_audio = Vec::new();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {RECORD_COLUMNS}
+             FROM audio_records
+             WHERE snippet_id = ?1 AND is_active = 1 AND paragraph_hash IS NOT NULL
+             ORDER BY updated_at DESC"
+        ))
+        .map_err(|e| format!("Failed to prepare paragraph audio query: {e}"))?;
+    let rows = stmt
+        .query_map(params![snippet_id], record_from_row)
+        .map_err(|e| format!("Failed to query paragraph audio: {e}"))?;
+    for row in rows {
+        paragraph_audio.push(row.map_err(|e| format!("Failed to read paragraph audio row: {e}"))?);
+    }
 
     let versions: i64 = conn
         .query_row(
@@ -954,6 +983,7 @@ fn get_snippet_summary(conn: &Connection, snippet_id: i64) -> Result<SnippetSumm
         updated_at,
         versions,
         active_audio,
+        paragraph_audio,
     })
 }
 
@@ -1138,8 +1168,7 @@ pub fn run() {
             save_api_key,
             clear_api_key,
             list_snippets,
-            generate_audio,
-            regenerate_audio,
+            generate_paragraph_audio,
             generate_voice_preview,
             get_audio_data_url
         ])
