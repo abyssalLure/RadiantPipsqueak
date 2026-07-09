@@ -58,6 +58,7 @@ type UsageSettings = {
   monthlyCharLimit: number;
   hardStop: boolean;
   defaultReadingInstructions: string;
+  sectionCharTarget: number;
 };
 
 type UsageTimelinePoint = {
@@ -81,8 +82,17 @@ type UsageLimitStatus = {
 
 type OpenMenu = "voice" | "model" | "session" | null;
 
+type Section = {
+  text: string;
+  firstParagraph: number;
+  lastParagraph: number;
+};
+
 const VOICES = ["alloy", "echo", "fable", "onyx", "nova", "shimmer"];
 const MODELS = ["gpt-4o-mini-tts", "tts-1", "tts-1-hd"];
+// OpenAI's /v1/audio/speech rejects inputs longer than this.
+const OPENAI_TTS_CHAR_LIMIT = 4096;
+const DEFAULT_SECTION_CHAR_TARGET = 3500;
 
 function formatCurrency(value: number) {
   return new Intl.NumberFormat("en-US", {
@@ -106,6 +116,80 @@ function splitParagraphs(text: string) {
     .split(/\n\s*\n+/)
     .map((paragraph) => paragraph.trim())
     .filter(Boolean);
+}
+
+function splitOversizedParagraph(paragraph: string, limit: number) {
+  const sentences = paragraph.match(/[^.!?…]+[.!?…]*\s*/g) ?? [paragraph];
+  const pieces: string[] = [];
+  let current = "";
+  const flush = () => {
+    const trimmed = current.trim();
+    if (trimmed) {
+      pieces.push(trimmed);
+    }
+    current = "";
+  };
+  for (let sentence of sentences) {
+    if (current && (current + sentence).length > limit) {
+      flush();
+    }
+    while (sentence.length > limit) {
+      pieces.push(sentence.slice(0, limit).trim());
+      sentence = sentence.slice(limit);
+    }
+    current += sentence;
+  }
+  flush();
+  return pieces;
+}
+
+// Groups consecutive paragraphs into sections of up to targetChars characters,
+// breaking only at paragraph boundaries — each section is one TTS take, so
+// bigger sections read more smoothly. A target of 0 means one paragraph per
+// section; paragraphs over the API limit are split at sentence boundaries.
+function buildSections(text: string, targetChars: number): Section[] {
+  const paragraphs = splitParagraphs(text);
+  const target = Math.min(Math.max(targetChars, 0), OPENAI_TTS_CHAR_LIMIT);
+  const sections: Section[] = [];
+  let pending: string[] = [];
+  let pendingFirst = 0;
+
+  const flush = (lastParagraph: number) => {
+    if (pending.length) {
+      sections.push({
+        text: pending.join("\n\n"),
+        firstParagraph: pendingFirst + 1,
+        lastParagraph: lastParagraph + 1,
+      });
+      pending = [];
+    }
+  };
+
+  paragraphs.forEach((paragraph, index) => {
+    if (paragraph.length > target) {
+      flush(index - 1);
+      if (paragraph.length > OPENAI_TTS_CHAR_LIMIT) {
+        for (const piece of splitOversizedParagraph(paragraph, OPENAI_TTS_CHAR_LIMIT)) {
+          sections.push({ text: piece, firstParagraph: index + 1, lastParagraph: index + 1 });
+        }
+      } else {
+        sections.push({ text: paragraph, firstParagraph: index + 1, lastParagraph: index + 1 });
+      }
+      return;
+    }
+    const joinedLength = pending.length
+      ? pending.join("\n\n").length + 2 + paragraph.length
+      : paragraph.length;
+    if (pending.length && joinedLength > target) {
+      flush(index - 1);
+    }
+    if (!pending.length) {
+      pendingFirst = index;
+    }
+    pending.push(paragraph);
+  });
+  flush(paragraphs.length - 1);
+  return sections;
 }
 
 function Wordmark() {
@@ -139,8 +223,8 @@ function App() {
   const [previewingVoice, setPreviewingVoice] = useState<string | null>(null);
 
   const [openMenu, setOpenMenu] = useState<OpenMenu>(null);
-  const [playingParagraph, setPlayingParagraph] = useState<number | null>(null);
-  const [generatingParagraph, setGeneratingParagraph] = useState<number | null>(null);
+  const [playingSection, setPlayingSection] = useState<number | null>(null);
+  const [generatingSection, setGeneratingSection] = useState<number | null>(null);
   const [audioProgress, setAudioProgress] = useState({ current: 0, duration: 0 });
   const [knownDurations, setKnownDurations] = useState<Record<number, number>>({});
 
@@ -151,6 +235,7 @@ function App() {
     monthlyCharLimit: 0,
     hardStop: false,
     defaultReadingInstructions: "",
+    sectionCharTarget: DEFAULT_SECTION_CHAR_TARGET,
   });
   const [usageTimeline, setUsageTimeline] = useState<UsageTimelinePoint[]>([]);
   const [usageLimitStatus, setUsageLimitStatus] = useState<UsageLimitStatus | null>(null);
@@ -168,13 +253,13 @@ function App() {
   const pendingPlayIndex = useRef<number | null>(null);
 
   const selectedSnippet = snippets.find((snippet) => snippet.id === selectedSnippetId) ?? null;
-  const sessionParagraphs = splitParagraphs(content);
+  const sessionSections = buildSections(content, usageSettings.sectionCharTarget);
 
-  // Each paragraph maps to its audio record for the current voice and model,
-  // matched by exact text — editing a paragraph or switching voice makes it
-  // "not generated" until that variant exists. Other voices' audio is kept, so
-  // switching back is instant and free.
-  const paragraphRecords = new Map<string, AudioRecordSummary>();
+  // Each section maps to its audio record for the current voice and model,
+  // matched by exact text — editing anything in a section or switching voice
+  // makes it "not generated" until that variant exists. Other voices' audio is
+  // kept, so switching back is instant and free.
+  const sectionRecords = new Map<string, AudioRecordSummary>();
   for (const record of selectedSnippet?.paragraphAudio ?? []) {
     if (
       record.status === "generated" &&
@@ -182,11 +267,11 @@ function App() {
       record.voice === voice &&
       record.model === model
     ) {
-      paragraphRecords.set(record.paragraphText, record);
+      sectionRecords.set(record.paragraphText, record);
     }
   }
 
-  const totalParagraphChars = sessionParagraphs.reduce((sum, paragraph) => sum + paragraph.length, 0);
+  const totalSectionChars = sessionSections.reduce((sum, section) => sum + section.text.length, 0);
 
   useEffect(() => {
     void bootstrap();
@@ -310,7 +395,7 @@ function App() {
   function stopPlayback() {
     pendingPlayIndex.current = null;
     audioRef.current?.pause();
-    setPlayingParagraph(null);
+    setPlayingSection(null);
     setAudioProgress({ current: 0, duration: 0 });
   }
 
@@ -349,8 +434,8 @@ function App() {
     });
   }
 
-  async function requestParagraphAudio(
-    paragraph: string,
+  async function requestSectionAudio(
+    sectionText: string,
     forceRegenerate: boolean,
     snippetId: number | null,
   ) {
@@ -359,7 +444,7 @@ function App() {
         snippetId,
         title,
         content,
-        paragraphText: paragraph,
+        paragraphText: sectionText,
         voice,
         model,
         readingInstructions:
@@ -371,30 +456,30 @@ function App() {
     return summary;
   }
 
-  async function handleGenerateParagraph(index: number, forceRegenerate: boolean) {
-    const paragraph = sessionParagraphs[index];
-    if (!paragraph) {
+  async function handleGenerateSection(index: number, forceRegenerate: boolean) {
+    const section = sessionSections[index];
+    if (!section) {
       return;
     }
 
     setBusy(true);
-    setGeneratingParagraph(index);
+    setGeneratingSection(index);
     setErrorMessage("");
-    setStatusMessage(forceRegenerate ? "Regenerating paragraph..." : "Generating paragraph...");
+    setStatusMessage(forceRegenerate ? "Regenerating section..." : "Generating section...");
     try {
-      await requestParagraphAudio(paragraph, forceRegenerate, selectedSnippetId);
+      await requestSectionAudio(section.text, forceRegenerate, selectedSnippetId);
       await refreshUsageData();
-      setStatusMessage(forceRegenerate ? "Paragraph regenerated." : "Paragraph readback ready.");
+      setStatusMessage(forceRegenerate ? "Section regenerated." : "Section readback ready.");
     } catch (error) {
       setErrorMessage(String(error));
     } finally {
       setBusy(false);
-      setGeneratingParagraph(null);
+      setGeneratingSection(null);
     }
   }
 
   async function handleGenerateAll() {
-    if (sessionParagraphs.length === 0) {
+    if (sessionSections.length === 0) {
       setErrorMessage("Add text content before generating audio.");
       return;
     }
@@ -405,38 +490,38 @@ function App() {
     let snippetId = selectedSnippetId;
     // Start reading from the top as soon as audio exists, unless the user is
     // already listening to something.
-    let autoplayArmed = playingParagraph === null;
+    let autoplayArmed = playingSection === null;
     pendingPlayIndex.current = null;
     try {
       if (autoplayArmed) {
-        const firstRecord = paragraphRecords.get(sessionParagraphs[0]);
+        const firstRecord = sectionRecords.get(sessionSections[0].text);
         if (firstRecord) {
           autoplayArmed = false;
-          void playParagraph(0, firstRecord);
+          void playSection(0, firstRecord);
         }
       }
 
-      for (let index = 0; index < sessionParagraphs.length; index += 1) {
-        const paragraph = sessionParagraphs[index];
-        if (paragraphRecords.has(paragraph)) {
+      for (let index = 0; index < sessionSections.length; index += 1) {
+        const section = sessionSections[index];
+        if (sectionRecords.has(section.text)) {
           continue;
         }
-        setGeneratingParagraph(index);
-        const summary = await requestParagraphAudio(paragraph, false, snippetId);
+        setGeneratingSection(index);
+        const summary = await requestSectionAudio(section.text, false, snippetId);
         snippetId = summary.id;
 
         const record = summary.paragraphAudio.find(
           (candidate) =>
-            candidate.paragraphText === paragraph &&
+            candidate.paragraphText === section.text &&
             candidate.voice === voice &&
             candidate.model === model,
         );
         if (record && autoplayArmed) {
           autoplayArmed = false;
-          void playParagraph(index, record);
+          void playSection(index, record);
         } else if (record && pendingPlayIndex.current === index) {
           pendingPlayIndex.current = null;
-          void playParagraph(index, record);
+          void playSection(index, record);
         }
       }
       await refreshUsageData();
@@ -445,23 +530,28 @@ function App() {
       setErrorMessage(String(error));
     } finally {
       setBusy(false);
-      setGeneratingParagraph(null);
+      setGeneratingSection(null);
       pendingPlayIndex.current = null;
     }
   }
 
-  async function playParagraph(index: number, record: AudioRecordSummary) {
+  async function fetchAudioUrl(recordId: number) {
+    let url = audioUrlCache.current.get(recordId);
+    if (!url) {
+      url = await invoke<string>("get_audio_data_url", { audioRecordId: recordId });
+      audioUrlCache.current.set(recordId, url);
+    }
+    return url;
+  }
+
+  async function playSection(index: number, record: AudioRecordSummary) {
     const audioElement = audioRef.current;
     if (!audioElement) {
       return;
     }
 
     try {
-      let url = audioUrlCache.current.get(record.id);
-      if (!url) {
-        url = await invoke<string>("get_audio_data_url", { audioRecordId: record.id });
-        audioUrlCache.current.set(record.id, url);
-      }
+      const url = await fetchAudioUrl(record.id);
       if (loadedRecordId.current !== record.id) {
         audioElement.src = url;
         loadedRecordId.current = record.id;
@@ -469,19 +559,26 @@ function App() {
       audioElement.currentTime = 0;
       await audioElement.play();
       setAudioProgress({ current: 0, duration: knownDurations[record.id] ?? 0 });
-      setPlayingParagraph(index);
+      setPlayingSection(index);
+
+      // Warm the next section's audio so auto-advance is gapless.
+      const nextSection = sessionSections[index + 1];
+      const nextRecord = nextSection ? sectionRecords.get(nextSection.text) : undefined;
+      if (nextRecord && !audioUrlCache.current.has(nextRecord.id)) {
+        void fetchAudioUrl(nextRecord.id).catch(() => {});
+      }
     } catch (error) {
       setErrorMessage(String(error));
-      setPlayingParagraph(null);
+      setPlayingSection(null);
     }
   }
 
-  async function toggleParagraphPlayback(index: number, record: AudioRecordSummary) {
-    if (playingParagraph === index) {
+  async function toggleSectionPlayback(index: number, record: AudioRecordSummary) {
+    if (playingSection === index) {
       stopPlayback();
       return;
     }
-    await playParagraph(index, record);
+    await playSection(index, record);
   }
 
   async function previewVoice(voiceName: string) {
@@ -525,6 +622,7 @@ function App() {
           monthlyCharLimit: Number(usageSettings.monthlyCharLimit || 0),
           hardStop: usageSettings.hardStop,
           defaultReadingInstructions: usageSettings.defaultReadingInstructions,
+          sectionCharTarget: Number(usageSettings.sectionCharTarget || 0),
         },
       });
       setUsageSettings(saved);
@@ -542,18 +640,18 @@ function App() {
     }
   }
 
-  function paragraphDuration(paragraph: string) {
-    if (!currentEstimate || totalParagraphChars === 0) {
+  function sectionDuration(sectionText: string) {
+    if (!currentEstimate || totalSectionChars === 0) {
       return 0;
     }
-    return currentEstimate.estimatedDurationSeconds * (paragraph.length / totalParagraphChars);
+    return currentEstimate.estimatedDurationSeconds * (sectionText.length / totalSectionChars);
   }
 
-  function paragraphCost(paragraph: string) {
+  function sectionCost(sectionText: string) {
     if (!currentEstimate || currentEstimate.charCount === 0) {
       return null;
     }
-    return (currentEstimate.estimatedCostUsd / currentEstimate.charCount) * paragraph.length;
+    return (currentEstimate.estimatedCostUsd / currentEstimate.charCount) * sectionText.length;
   }
 
   if (isLoading) {
@@ -816,7 +914,7 @@ function App() {
                 <div className="readback-header">
                   <span className="micro-label">Readback</span>
                   <span className="readback-header-right">
-                    {sessionParagraphs.some((paragraph) => !paragraphRecords.has(paragraph)) ? (
+                    {sessionSections.some((section) => !sectionRecords.has(section.text)) ? (
                       <button
                         className="generate-all-link"
                         onClick={() => void handleGenerateAll()}
@@ -827,35 +925,42 @@ function App() {
                       </button>
                     ) : null}
                     <span className="readback-count">
-                      {sessionParagraphs.length} {sessionParagraphs.length === 1 ? "paragraph" : "paragraphs"}
+                      {sessionSections.length} {sessionSections.length === 1 ? "section" : "sections"}
                     </span>
                   </span>
                 </div>
 
-                {sessionParagraphs.length === 0 ? (
+                {sessionSections.length === 0 ? (
                   <div className="readback-empty">
                     <div className="readback-empty-title">Nothing to read yet</div>
                     <div className="readback-empty-hint">
-                      Type in the manuscript on the left. Each paragraph appears here, ready to voice.
+                      Type in the manuscript on the left. Each section appears here, ready to voice.
                     </div>
                   </div>
                 ) : (
                   <div className="paragraph-list">
-                    {sessionParagraphs.map((paragraph, index) => {
-                      const record = paragraphRecords.get(paragraph) ?? null;
-                      const isPlaying = playingParagraph === index;
-                      const isGenerating = generatingParagraph === index;
+                    {sessionSections.map((section, index) => {
+                      const record = sectionRecords.get(section.text) ?? null;
+                      const isPlaying = playingSection === index;
+                      const isGenerating = generatingSection === index;
                       const displaySeconds =
-                        (record ? knownDurations[record.id] : undefined) ?? paragraphDuration(paragraph);
-                      const costEstimate = record ? record.estimatedCostUsd : paragraphCost(paragraph);
+                        (record ? knownDurations[record.id] : undefined) ?? sectionDuration(section.text);
+                      const costEstimate = record ? record.estimatedCostUsd : sectionCost(section.text);
                       const progressPct =
                         isPlaying && audioProgress.duration > 0
                           ? Math.min(100, (audioProgress.current / audioProgress.duration) * 100)
                           : 0;
+                      const paragraphRange =
+                        section.lastParagraph > section.firstParagraph
+                          ? ` · ¶ ${section.firstParagraph}–${section.lastParagraph}`
+                          : "";
                       return (
                         <article className="paragraph-card" key={`${selectedSnippetId ?? "draft"}-${index}`}>
                           <div className="paragraph-card-header">
-                            <span className="micro-label">Paragraph {index + 1}</span>
+                            <span className="micro-label">
+                              Section {index + 1}
+                              {paragraphRange}
+                            </span>
                             <span className="paragraph-card-meta">
                               {record ? formatTime(displaySeconds) : "not generated"}
                               {costEstimate !== null
@@ -863,12 +968,16 @@ function App() {
                                 : ""}
                             </span>
                           </div>
-                          <p className="paragraph-text">{paragraph}</p>
+                          <div className="section-text">
+                            {splitParagraphs(section.text).map((paragraph, paragraphIndex) => (
+                              <p key={paragraphIndex}>{paragraph}</p>
+                            ))}
+                          </div>
                           {record ? (
                             <div className="playback-row">
                               <button
                                 className="play-button"
-                                onClick={() => void toggleParagraphPlayback(index, record)}
+                                onClick={() => void toggleSectionPlayback(index, record)}
                                 disabled={busy && !isPlaying}
                                 title={isPlaying ? "Pause" : "Play"}
                                 type="button"
@@ -885,7 +994,7 @@ function App() {
                               </span>
                               <button
                                 className="regen-button"
-                                onClick={() => void handleGenerateParagraph(index, true)}
+                                onClick={() => void handleGenerateSection(index, true)}
                                 disabled={busy}
                                 title="Regenerate"
                                 type="button"
@@ -896,7 +1005,7 @@ function App() {
                           ) : (
                             <button
                               className="generate-readback-button"
-                              onClick={() => void handleGenerateParagraph(index, false)}
+                              onClick={() => void handleGenerateSection(index, false)}
                               disabled={busy}
                               type="button"
                             >
@@ -997,12 +1106,10 @@ function App() {
                   min="0"
                   step="0.01"
                   value={usageSettings.monthlyBudgetUsd}
-                  onChange={(event) =>
-                    setUsageSettings((current) => ({
-                      ...current,
-                      monthlyBudgetUsd: Number(event.currentTarget.value),
-                    }))
-                  }
+                  onChange={(event) => {
+                    const value = Number(event.currentTarget.value);
+                    setUsageSettings((current) => ({ ...current, monthlyBudgetUsd: value }));
+                  }}
                 />
 
                 <label className="field-label" htmlFor="monthly-chars">
@@ -1015,25 +1122,43 @@ function App() {
                   min="0"
                   step="1"
                   value={usageSettings.monthlyCharLimit}
-                  onChange={(event) =>
-                    setUsageSettings((current) => ({
-                      ...current,
-                      monthlyCharLimit: Number(event.currentTarget.value),
-                    }))
-                  }
+                  onChange={(event) => {
+                    const value = Number(event.currentTarget.value);
+                    setUsageSettings((current) => ({ ...current, monthlyCharLimit: value }));
+                  }}
                 />
+
+                <label className="field-label" htmlFor="section-size">
+                  Section size (characters)
+                </label>
+                <input
+                  id="section-size"
+                  className="settings-input"
+                  type="number"
+                  min="0"
+                  max={OPENAI_TTS_CHAR_LIMIT}
+                  step="100"
+                  value={usageSettings.sectionCharTarget}
+                  onChange={(event) => {
+                    const value = Number(event.currentTarget.value);
+                    setUsageSettings((current) => ({ ...current, sectionCharTarget: value }));
+                  }}
+                />
+                <p className="field-hint">
+                  Paragraphs are grouped into sections of up to this many characters — one
+                  continuous voice take each. Bigger sections read more smoothly; set it low for
+                  per-paragraph readbacks. Max {formatNumber(OPENAI_TTS_CHAR_LIMIT)}.
+                </p>
 
                 <label className="checkbox-row" htmlFor="hard-stop">
                   <input
                     id="hard-stop"
                     type="checkbox"
                     checked={usageSettings.hardStop}
-                    onChange={(event) =>
-                      setUsageSettings((current) => ({
-                        ...current,
-                        hardStop: event.currentTarget.checked,
-                      }))
-                    }
+                    onChange={(event) => {
+                      const checked = event.currentTarget.checked;
+                      setUsageSettings((current) => ({ ...current, hardStop: checked }));
+                    }}
                   />
                   <span>Hard stop when a limit is reached</span>
                 </label>
@@ -1045,12 +1170,10 @@ function App() {
                   id="default-reading-instructions"
                   className="settings-textarea rp-scroll"
                   value={usageSettings.defaultReadingInstructions}
-                  onChange={(event) =>
-                    setUsageSettings((current) => ({
-                      ...current,
-                      defaultReadingInstructions: event.currentTarget.value,
-                    }))
-                  }
+                  onChange={(event) => {
+                    const value = event.currentTarget.value;
+                    setUsageSettings((current) => ({ ...current, defaultReadingInstructions: value }));
+                  }}
                   placeholder="Example: Read like a calm narrator with warm pacing and gentle pauses."
                 />
 
@@ -1100,19 +1223,19 @@ function App() {
         }
         onEnded={() => {
           setAudioProgress({ current: 0, duration: 0 });
-          // Continue into the next paragraph when its audio is current; if it's
+          // Continue into the next section when its audio is current; if it's
           // still being generated, park the index for the loop to resume.
-          const nextIndex = playingParagraph === null ? null : playingParagraph + 1;
-          const nextParagraph = nextIndex === null ? undefined : sessionParagraphs[nextIndex];
-          const nextRecord = nextParagraph ? paragraphRecords.get(nextParagraph) : undefined;
+          const nextIndex = playingSection === null ? null : playingSection + 1;
+          const nextSection = nextIndex === null ? undefined : sessionSections[nextIndex];
+          const nextRecord = nextSection ? sectionRecords.get(nextSection.text) : undefined;
           if (nextIndex !== null && nextRecord) {
-            void playParagraph(nextIndex, nextRecord);
+            void playSection(nextIndex, nextRecord);
             return;
           }
-          if (nextIndex !== null && nextParagraph && busy) {
+          if (nextIndex !== null && nextSection && busy) {
             pendingPlayIndex.current = nextIndex;
           }
-          setPlayingParagraph(null);
+          setPlayingSection(null);
         }}
       />
       <audio

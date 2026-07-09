@@ -14,6 +14,9 @@ use tauri::{AppHandle, Manager};
 
 const DEFAULT_MODEL: &str = "gpt-4o-mini-tts";
 const DEFAULT_VOICE: &str = "alloy";
+// OpenAI's /v1/audio/speech rejects inputs longer than this.
+const OPENAI_TTS_CHAR_LIMIT: i64 = 4096;
+const DEFAULT_SECTION_CHAR_TARGET: i64 = 3500;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -49,6 +52,7 @@ struct UsageSettings {
     monthly_char_limit: i64,
     hard_stop: bool,
     default_reading_instructions: String,
+    section_char_target: i64,
 }
 
 #[derive(Serialize)]
@@ -221,18 +225,20 @@ fn save_usage_settings(app: AppHandle, settings: UsageSettings) -> Result<UsageS
         settings.monthly_char_limit
     };
     let instructions = settings.default_reading_instructions.trim().to_string();
+    let section_target = settings.section_char_target.clamp(0, OPENAI_TTS_CHAR_LIMIT);
     let now = now_iso();
 
     conn.execute(
-        "INSERT INTO usage_settings (id, monthly_budget_usd, monthly_char_limit, hard_stop, default_reading_instructions, updated_at)
-         VALUES (1, ?1, ?2, ?3, ?4, ?5)
+        "INSERT INTO usage_settings (id, monthly_budget_usd, monthly_char_limit, hard_stop, default_reading_instructions, section_char_target, updated_at)
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6)
          ON CONFLICT(id) DO UPDATE SET
            monthly_budget_usd = excluded.monthly_budget_usd,
            monthly_char_limit = excluded.monthly_char_limit,
            hard_stop = excluded.hard_stop,
            default_reading_instructions = excluded.default_reading_instructions,
+           section_char_target = excluded.section_char_target,
            updated_at = excluded.updated_at",
-        params![budget, chars, bool_to_i64(settings.hard_stop), instructions, now],
+        params![budget, chars, bool_to_i64(settings.hard_stop), instructions, section_target, now],
     )
     .map_err(|e| format!("Failed to save usage settings: {e}"))?;
 
@@ -351,6 +357,11 @@ async fn generate_paragraph_audio(
     let paragraph = request.paragraph_text.trim();
     if paragraph.is_empty() {
         return Err("Paragraph text is required".to_string());
+    }
+    if paragraph.chars().count() as i64 > OPENAI_TTS_CHAR_LIMIT {
+        return Err(format!(
+            "Section is longer than OpenAI's {OPENAI_TTS_CHAR_LIMIT} character limit; lower the section size in Usage & Settings"
+        ));
     }
 
     let voice = request
@@ -537,6 +548,7 @@ fn ensure_storage(app: &AppHandle) -> Result<(), String> {
             monthly_char_limit INTEGER NOT NULL DEFAULT 0,
             hard_stop INTEGER NOT NULL DEFAULT 1,
             default_reading_instructions TEXT NOT NULL DEFAULT '',
+            section_char_target INTEGER NOT NULL DEFAULT 3500,
             updated_at TEXT NOT NULL
         );
         ",
@@ -559,6 +571,7 @@ fn ensure_usage_settings_seed(conn: &Connection) -> Result<(), String> {
     .map_err(|e| format!("Failed to seed usage settings: {e}"))?;
 
     let mut has_default_instructions = false;
+    let mut has_section_target = false;
     let mut stmt = conn
         .prepare("PRAGMA table_info(usage_settings)")
         .map_err(|e| format!("Failed to inspect usage_settings schema: {e}"))?;
@@ -566,11 +579,12 @@ fn ensure_usage_settings_seed(conn: &Connection) -> Result<(), String> {
         .query_map([], |row| row.get::<_, String>(1))
         .map_err(|e| format!("Failed to inspect usage_settings columns: {e}"))?;
     for row in rows {
-        if row.map_err(|e| format!("Failed to read usage_settings column info: {e}"))?
-            == "default_reading_instructions"
-        {
+        let column = row.map_err(|e| format!("Failed to read usage_settings column info: {e}"))?;
+        if column == "default_reading_instructions" {
             has_default_instructions = true;
-            break;
+        }
+        if column == "section_char_target" {
+            has_section_target = true;
         }
     }
 
@@ -580,6 +594,16 @@ fn ensure_usage_settings_seed(conn: &Connection) -> Result<(), String> {
             [],
         )
         .map_err(|e| format!("Failed to migrate usage_settings.default_reading_instructions: {e}"))?;
+    }
+
+    if !has_section_target {
+        conn.execute(
+            &format!(
+                "ALTER TABLE usage_settings ADD COLUMN section_char_target INTEGER NOT NULL DEFAULT {DEFAULT_SECTION_CHAR_TARGET}"
+            ),
+            [],
+        )
+        .map_err(|e| format!("Failed to migrate usage_settings.section_char_target: {e}"))?;
     }
 
     Ok(())
@@ -595,7 +619,7 @@ fn bool_to_i64(value: bool) -> i64 {
 
 fn load_usage_settings(conn: &Connection) -> Result<UsageSettings, String> {
     conn.query_row(
-        "SELECT monthly_budget_usd, monthly_char_limit, hard_stop, default_reading_instructions FROM usage_settings WHERE id = 1",
+        "SELECT monthly_budget_usd, monthly_char_limit, hard_stop, default_reading_instructions, section_char_target FROM usage_settings WHERE id = 1",
         [],
         |row| {
             let hard_stop_flag: i64 = row.get(2)?;
@@ -604,6 +628,7 @@ fn load_usage_settings(conn: &Connection) -> Result<UsageSettings, String> {
                 monthly_char_limit: row.get(1)?,
                 hard_stop: hard_stop_flag == 1,
                 default_reading_instructions: row.get(3)?,
+                section_char_target: row.get(4)?,
             })
         },
     )
